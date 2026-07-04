@@ -32,6 +32,10 @@ DEBUG = True
 
 ALLOWED_HOSTS = ['144.217.10.38', 'localhost', '127.0.0.1']
 
+# Metadatos de auditoría inyectados en documentos exportados (ver documentos/services/exportar.py)
+APP_NAME = 'Enfoque Platform'
+APP_VERSION = '1.0.4'
+
 
 # Application definition
 

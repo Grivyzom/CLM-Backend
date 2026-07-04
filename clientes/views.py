@@ -46,22 +46,23 @@ def _get_contratos_activos(cliente_id):
     ]
 
 
-def get_filtered_clientes_unified(request):
+def get_filtered_clientes_unified(query_params):
     """
     Aplica los filtros (search, estado, tipo, fecha_desde, fecha_hasta) leídos de
-    request.query_params y devuelve la lista unificada de clientes (PersonaJuridica +
-    PersonaNatural) ordenada por fecha_registro desc, SIN paginar.
+    query_params (dict-like: QueryDict de Django o request.query_params de DRF) y
+    devuelve la lista unificada de clientes (PersonaJuridica + PersonaNatural)
+    ordenada por fecha_registro desc, SIN paginar.
 
     Reutilizado por ClienteListView.get (paginación) y por las vistas de exportación
     de documentos (que necesitan el mismo conjunto filtrado completo).
 
     Cada item: {obj, tipo, estado, fecha_registro, contratos_count, contacto}
     """
-    search      = request.query_params.get('search', '').strip()
-    estado_q    = request.query_params.get('estado', 'Todos').strip()
-    tipo_q      = request.query_params.get('tipo', 'Todos').strip()
-    fecha_desde = request.query_params.get('fecha_desde', None)
-    fecha_hasta = request.query_params.get('fecha_hasta', None)
+    search      = query_params.get('search', '').strip()
+    estado_q    = query_params.get('estado', 'Todos').strip()
+    tipo_q      = query_params.get('tipo', 'Todos').strip()
+    fecha_desde = query_params.get('fecha_desde', None)
+    fecha_hasta = query_params.get('fecha_hasta', None)
 
     # ── Querysets base ───────────────────────────────────────────────────
     pj_qs = PersonaJuridica.objects.all()
@@ -229,7 +230,7 @@ class ClienteListView(APIView):
         offset = (page - 1) * page_size
 
         # Lista unificada (todos los clientes que matchean search/estado/tipo/fechas, sin paginar)
-        unified = get_filtered_clientes_unified(request)
+        unified = get_filtered_clientes_unified(request.query_params)
 
         # ── Totales para stats ───────────────────────────────────────────────
         total_all   = len(unified)
