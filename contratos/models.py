@@ -1,6 +1,7 @@
 from django.db import models
 from django.db.models import CheckConstraint, Q, F
 from core.middleware import ThreadLocalContext
+from django.conf import settings
 
 class SoftwareScopedManager(models.Manager):
     def get_queryset(self):
@@ -42,12 +43,23 @@ class EstadoContrato(models.TextChoices):
     SUSPENDIDO = 'SUSPENDIDO', 'Suspendido'
     VENCIDO = 'VENCIDO', 'Vencido'
 
+class EtapaContrato(models.TextChoices):
+    BORRADOR = 'BORRADOR', 'Borrador (Draft)'
+    REVISION = 'REVISION', 'En Revisión / Negociación'
+    APROBADO = 'APROBADO', 'Aprobado internamente'
+    PENDIENTE_FIRMA = 'PENDIENTE_FIRMA', 'Pendiente de Firma'
+    ACTIVO = 'ACTIVO', 'Activo / Ejecutado'
+    ENMENDADO = 'ENMENDADO', 'Enmendado (Amended)'
+    TERMINADO = 'TERMINADO', 'Terminado / Expirado'
+
+
 class Contrato(models.Model):
     id = models.BigAutoField(primary_key=True)
     cliente = models.ForeignKey('clientes.Cliente', on_delete=models.PROTECT, db_column='cliente_id')
     software = models.ForeignKey('catalogo.Software', on_delete=models.PROTECT, db_column='software_id')
     sla = models.ForeignKey(SLA, on_delete=models.PROTECT, db_column='sla_id')
     
+    etapa = models.CharField(max_length=30, choices=EtapaContrato.choices, default=EtapaContrato.BORRADOR)
     tipo_contrato = models.CharField(max_length=30, choices=TipoContrato.choices)
     status = models.CharField(max_length=30, choices=EstadoContrato.choices, default=EstadoContrato.ACTIVO)
     monto = models.DecimalField(max_digits=15, decimal_places=4, default=0.0000)
@@ -80,6 +92,33 @@ class Contrato(models.Model):
                 name='chk_dias_gracia_positivos'
             )
         ]
+
+    def transicionar_etapa(self, nueva_etapa, usuario=None, notas=""):
+        if self.etapa != nueva_etapa:
+            from django.db import transaction
+            with transaction.atomic():
+                HistorialEtapaContrato.objects.create(
+                    contrato=self,
+                    etapa_anterior=self.etapa,
+                    etapa_nueva=nueva_etapa,
+                    usuario=usuario,
+                    notas=notas
+                )
+                self.etapa = nueva_etapa
+                self.save(update_fields=['etapa'])
+
+class HistorialEtapaContrato(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE, related_name='historial_etapas', db_column='contrato_id')
+    etapa_anterior = models.CharField(max_length=30, choices=EtapaContrato.choices, null=True, blank=True)
+    etapa_nueva = models.CharField(max_length=30, choices=EtapaContrato.choices)
+    fecha_cambio = models.DateTimeField(auto_now_add=True)
+    usuario = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    notas = models.TextField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'contratos_historialetapa'
+
 
 class RegistroPerdonazo(models.Model):
     id = models.BigAutoField(primary_key=True)
