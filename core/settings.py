@@ -30,7 +30,7 @@ SECRET_KEY = 'django-insecure-$+=zhl#u$2u5no#cvk+15)#%p)$r3k^0yh8d0)5z*$j1^=nanq
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['144.217.10.38']
+ALLOWED_HOSTS = ['144.217.10.38', 'localhost', '127.0.0.1']
 
 
 # Application definition
@@ -42,21 +42,31 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'corsheaders',
+    'core',
     'clientes',
     'catalogo',
     'contratos',
     'legal',
-
+    'documentos',
+    'axes',
+    'django_otp',
+    'django_otp.plugins.otp_totp',
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django_otp.middleware.OTPMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'core.middleware.SoftwareIsolationMiddleware',
+    'axes.middleware.AxesMiddleware',
 ]
 
 ROOT_URLCONF = 'core.urls'
@@ -64,7 +74,7 @@ ROOT_URLCONF = 'core.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -135,3 +145,65 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Archivos subidos por los usuarios / Documentos de proyectos
+MEDIA_URL = '/media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# ==========================================
+# CONFIGURACIONES DE SEGURIDAD GRADO MILITAR
+# ==========================================
+
+# 1. Backends de autenticación (Soporte para Axes)
+AUTHENTICATION_BACKENDS = [
+    'axes.backends.AxesStandaloneBackend',
+    'django.contrib.auth.backends.ModelBackend',
+]
+
+# 2. Configuración de Django Axes (Bloqueo de fuerza bruta)
+AXES_FAILURE_LIMIT = 3 # Bloquear tras 3 intentos fallidos
+AXES_COOLOFF_TIME = 1 # Tiempo de bloqueo en horas
+AXES_RESET_ON_SUCCESS = True # Resetear contadores al loguearse con éxito
+AXES_LOCKOUT_PARAMETERS = [["username", "ip_address"]] # Bloquear por combinación de usuario e IP
+
+# 3. Seguridad de Sesiones y Cookies
+# NOTA: En producción (HTTPS) cambiar SESSION_COOKIE_SECURE y CSRF_COOKIE_SECURE a True
+SESSION_COOKIE_SECURE = False      # False para desarrollo HTTP local
+CSRF_COOKIE_SECURE = False         # False para desarrollo HTTP local
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'   # Lax permite cookies desde el frontend Vite en dev
+CSRF_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_AGE = 900           # 15 minutos de inactividad
+
+# ==========================================
+# DJANGO REST FRAMEWORK
+# ==========================================
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+}
+
+# ==========================================
+# CORS (para el frontend Vite en desarrollo)
+# ==========================================
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+    'http://localhost:5176',
+    'http://127.0.0.1:5173',
+]
+CORS_ALLOW_CREDENTIALS = True
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+    'http://localhost:5176',
+    'http://127.0.0.1:5173',
+    'http://144.217.10.38:5173',
+]

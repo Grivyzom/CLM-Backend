@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${DB_USER:-tu_usuario}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-tu_password}
+      POSTGRES_DB: ${DB_NAME:-tu_base_de_datos}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    ports:
+      - "5432:5432"
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DATABASE_URL: "postgres://${DB_USER:-tu_usuario}:${DB_PASSWORD:-tu_password}@db:5432/${DB_NAME:-tu_base_de_datos}"
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 20
+    ports:
+      - "6432:5432"
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
