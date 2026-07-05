@@ -28,6 +28,7 @@ urlpatterns = [
     path('api/config/currency/', views.api_currency_config, name='api_currency_config'),
     path('api/clientes/', include('clientes.urls')),
     path('api/documentos/', include('documentos.urls')),
+    path('api/plantillas/', include('plantillas.urls')),
     path('api/', include('contratos.urls')),
 ]
 

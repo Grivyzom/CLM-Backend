@@ -28,7 +28,8 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 SECRET_KEY = 'django-insecure-$+=zhl#u$2u5no#cvk+15)#%p)$r3k^0yh8d0)5z*$j1^=nanq'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Default False (seguro) — se activa solo si .env trae DEBUG=True.
+DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
 
 ALLOWED_HOSTS = ['144.217.10.38', 'localhost', '127.0.0.1']
 
@@ -54,6 +55,7 @@ INSTALLED_APPS = [
     'contratos',
     'legal',
     'documentos',
+    'plantillas',
     'axes',
     'django_otp',
     'django_otp.plugins.otp_totp',
@@ -153,6 +155,11 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Archivos subidos por los usuarios / Documentos de proyectos
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+# Motor de plantillas (ver app 'plantillas'): binario de LibreOffice usado para
+# convertir el .docx renderizado a PDF, y límite de tamaño para plantillas subidas.
+LIBREOFFICE_BINARY = os.environ.get('LIBREOFFICE_BINARY', 'soffice')
+PLANTILLAS_MAX_UPLOAD_MB = int(os.environ.get('PLANTILLAS_MAX_UPLOAD_MB', 10))
 
 # ==========================================
 # CONFIGURACIONES DE SEGURIDAD GRADO MILITAR
