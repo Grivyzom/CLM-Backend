@@ -28,3 +28,33 @@ class SoftwareVersion(models.Model):
 
     def __str__(self):
         return f"{self.software.nombre} - {self.version_semver}"
+
+class Producto(models.Model):
+    CATEGORIAS = [
+        ('Software', 'Software'),
+        ('Servicio', 'Servicio'),
+        ('Soporte', 'Soporte'),
+        ('Formación', 'Formación'),
+    ]
+    ESTADOS = [
+        ('Activo', 'Activo'),
+        ('Descontinuado', 'Descontinuado'),
+    ]
+
+    id = models.BigAutoField(primary_key=True)
+    sku = models.CharField(max_length=40, unique=True)
+    nombre = models.CharField(max_length=150)
+    descripcion = models.TextField(blank=True, null=True)
+    categoria = models.CharField(max_length=20, choices=CATEGORIAS, default='Software')
+    precio = models.DecimalField(max_digits=12, decimal_places=2)
+    moneda = models.CharField(max_length=8, default='USD')
+    unidad = models.CharField(max_length=40, blank=True, default='')
+    estado = models.CharField(max_length=20, choices=ESTADOS, default='Activo')
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'catalogo_producto'
+        ordering = ['nombre']
+
+    def __str__(self):
+        return f"{self.sku} - {self.nombre}"

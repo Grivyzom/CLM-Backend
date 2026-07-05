@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Software, SoftwareVersion
+from .models import Software, SoftwareVersion, Producto
 
 class VersionInline(admin.TabularInline):
     model = SoftwareVersion
@@ -11,3 +11,9 @@ class SoftwareAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('nombre',)}
     readonly_fields = ('api_key', 'fecha_creacion')
     inlines = [VersionInline]
+
+@admin.register(Producto)
+class ProductoAdmin(admin.ModelAdmin):
+    list_display = ('sku', 'nombre', 'categoria', 'precio', 'moneda', 'estado')
+    list_filter = ('categoria', 'estado')
+    search_fields = ('sku', 'nombre')
