@@ -74,67 +74,115 @@ def excel_a_clientes(archivo):
     """
     Ingesta clientes desde Excel.
 
-    Columnas esperadas para Persona Natural:
-        tipo | run | nombre_completo | email | telefono
-
-    Columnas esperadas para Persona Jurídica:
-        tipo | rut | razon_social | giro | email | telefono
-
-    'tipo' debe ser 'natural' o 'juridica'.
+    Soporta el formato de importación original y el formato generado por la exportación.
     Devuelve dict con listas: creados, actualizados, errores.
     """
     from clientes.models import Cliente, PersonaNatural, PersonaJuridica
+    import unicodedata
 
     df = pd.read_excel(archivo, dtype=str).fillna("")
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    
+    def clean_col(c):
+        c = unicodedata.normalize('NFKD', str(c)).encode('ASCII', 'ignore').decode('utf-8')
+        c = c.lower().strip()
+        for char in [' ', '/', '-', '.']:
+            c = c.replace(char, '_')
+        while '__' in c:
+            c = c.replace('__', '_')
+        return c.strip('_')
+
+    df.columns = [clean_col(c) for c in df.columns]
 
     creados, actualizados, errores = [], [], []
 
     for idx, fila in df.iterrows():
-        tipo = fila.get("tipo", "").strip().lower()
-        email = fila.get("email", "").strip()
-        telefono = fila.get("telefono", "").strip() or None
+        tipo_raw = str(fila.get("tipo", "")).strip().lower()
+        if "natural" in tipo_raw:
+            tipo = "natural"
+        elif "juridica" in tipo_raw or "jurídica" in tipo_raw:
+            tipo = "juridica"
+        else:
+            tipo = tipo_raw
+
+        email = str(fila.get("email", "")).strip()
+        telefono = str(fila.get("telefono", "")).strip() or None
+        
+        activo_raw = str(fila.get("activo", "")).strip().lower()
+        is_active = False if activo_raw in ("no", "false", "0", "f") else True
+        
         num_fila = idx + 2  # 1-indexed + encabezado
 
         if not email:
             errores.append({"fila": num_fila, "error": "email vacío"})
             continue
 
+        identificador = str(fila.get("identificador", "")).strip()
+        nombre_rs = str(fila.get("nombre_razon_social", "")).strip()
+
         try:
             if tipo == "natural":
-                run = fila.get("run", "").strip()
-                nombre = fila.get("nombre_completo", "").strip()
+                run = str(fila.get("run", "")).strip() or identificador
+                nombre = str(fila.get("nombre_completo", "")).strip() or nombre_rs
                 if not run or not nombre:
                     errores.append({"fila": num_fila, "error": "run o nombre_completo vacío"})
                     continue
 
-                cliente_base, creado = Cliente.objects.update_or_create(
-                    email_principal=email,
-                    defaults={"telefono_contacto": telefono, "is_active": True},
-                )
-                PersonaNatural.objects.update_or_create(
-                    cliente_ptr=cliente_base,
-                    defaults={"run": run, "nombre_completo": nombre},
-                )
+                try:
+                    c = Cliente.objects.get(email_principal=email)
+                    if not hasattr(c, 'personanatural'):
+                        errores.append({"fila": num_fila, "error": "El email ya está registrado como Persona Jurídica"})
+                        continue
+                    pn = c.personanatural
+                    pn.telefono_contacto = telefono
+                    pn.is_active = is_active
+                    pn.run = run
+                    pn.nombre_completo = nombre
+                    pn.save()
+                    creado = False
+                except Cliente.DoesNotExist:
+                    PersonaNatural.objects.create(
+                        email_principal=email,
+                        telefono_contacto=telefono,
+                        is_active=is_active,
+                        run=run,
+                        nombre_completo=nombre
+                    )
+                    creado = True
 
             elif tipo == "juridica":
-                rut = fila.get("rut", "").strip()
-                razon = fila.get("razon_social", "").strip()
-                giro = fila.get("giro", "").strip()
+                rut = str(fila.get("rut", "")).strip() or identificador
+                razon = str(fila.get("razon_social", "")).strip() or nombre_rs
+                giro = str(fila.get("giro", "")).strip() or "Sin giro"
+                
                 if not rut or not razon:
                     errores.append({"fila": num_fila, "error": "rut o razon_social vacío"})
                     continue
 
-                cliente_base, creado = Cliente.objects.update_or_create(
-                    email_principal=email,
-                    defaults={"telefono_contacto": telefono, "is_active": True},
-                )
-                PersonaJuridica.objects.update_or_create(
-                    cliente_ptr=cliente_base,
-                    defaults={"rut": rut, "razon_social": razon, "giro": giro},
-                )
+                try:
+                    c = Cliente.objects.get(email_principal=email)
+                    if not hasattr(c, 'personajuridica'):
+                        errores.append({"fila": num_fila, "error": "El email ya está registrado como Persona Natural"})
+                        continue
+                    pj = c.personajuridica
+                    pj.telefono_contacto = telefono
+                    pj.is_active = is_active
+                    pj.rut = rut
+                    pj.razon_social = razon
+                    pj.giro = giro
+                    pj.save()
+                    creado = False
+                except Cliente.DoesNotExist:
+                    PersonaJuridica.objects.create(
+                        email_principal=email,
+                        telefono_contacto=telefono,
+                        is_active=is_active,
+                        rut=rut,
+                        razon_social=razon,
+                        giro=giro
+                    )
+                    creado = True
             else:
-                errores.append({"fila": num_fila, "error": f"tipo desconocido: '{tipo}'"})
+                errores.append({"fila": num_fila, "error": f"tipo desconocido: '{tipo_raw}'"})
                 continue
 
             if creado:
