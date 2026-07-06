@@ -22,7 +22,7 @@ def _compute_estado(is_active, cliente_id, contrato_status_map):
         return 'Activo'
     if statuses & {'MORA', 'GRACIA'}:
         return 'En revisión'
-    return 'Inactivo'
+    return 'Activo'
 
 
 def _get_contratos_activos(cliente_id):

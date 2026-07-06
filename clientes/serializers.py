@@ -51,7 +51,7 @@ class PersonaJuridicaSerializer(serializers.ModelSerializer):
         ).exists()
         if has_mora:
             return 'En revisión'
-        return 'Inactivo'
+        return 'Activo'
 
     def get_contratos_count(self, obj):
         return self._get_from_context(obj, 'contratos_count', 0)
@@ -117,7 +117,7 @@ class PersonaNaturalSerializer(serializers.ModelSerializer):
         ).exists()
         if has_mora:
             return 'En revisión'
-        return 'Inactivo'
+        return 'Activo'
 
     def get_contratos_count(self, obj):
         return self._get_from_context(obj, 'contratos_count', 0)
