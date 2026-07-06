@@ -31,10 +31,12 @@ class SoftwareVersion(models.Model):
 
 class Producto(models.Model):
     CATEGORIAS = [
+        ('Bot', 'Bot'),
+        ('Agente', 'Agente'),
+        ('Script', 'Script'),
         ('Software', 'Software'),
-        ('Servicio', 'Servicio'),
-        ('Soporte', 'Soporte'),
-        ('Formación', 'Formación'),
+        ('Auditoría', 'Auditoría'),
+        ('Consultoría', 'Consultoría'),
     ]
     ESTADOS = [
         ('Activo', 'Activo'),
@@ -46,10 +48,12 @@ class Producto(models.Model):
     nombre = models.CharField(max_length=150)
     descripcion = models.TextField(blank=True, null=True)
     categoria = models.CharField(max_length=20, choices=CATEGORIAS, default='Software')
+    tipo_licencia = models.CharField(max_length=30, default='Comercial')
     precio = models.DecimalField(max_digits=12, decimal_places=2)
     moneda = models.CharField(max_length=8, default='USD')
     unidad = models.CharField(max_length=40, blank=True, default='')
     estado = models.CharField(max_length=20, choices=ESTADOS, default='Activo')
+    datos_adicionales = models.JSONField(default=dict, blank=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
 
     class Meta:

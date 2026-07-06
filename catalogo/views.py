@@ -36,13 +36,15 @@ def _producto_a_dict(p):
         'currency': p.moneda,
         'unit': p.unidad,
         'status': p.estado,
+        'tipo_licencia': p.tipo_licencia,
+        'datos_adicionales': p.datos_adicionales or {},
     }
 
 
 class ProductoListCreateView(APIView):
     """
     GET  /api/catalogo/productos/?search=&categoria=
-    POST /api/catalogo/productos/  { sku, name, desc, cat, price, currency, unit, status }
+    POST /api/catalogo/productos/  { name, desc, cat, price, currency, unit, status, tipo_licencia, datos_adicionales }
     """
     permission_classes = [IsAuthenticated]
 
@@ -57,23 +59,35 @@ class ProductoListCreateView(APIView):
         return Response([_producto_a_dict(p) for p in qs])
 
     def post(self, request):
+        import datetime
+        import random
+        import string
+
         data = request.data
-        sku = (data.get('sku') or '').strip()
         nombre = (data.get('name') or '').strip()
-        if not sku:
-            raise DRFValidationError({'sku': 'Este campo es requerido.'})
         if not nombre:
             raise DRFValidationError({'name': 'Este campo es requerido.'})
+
+        # Auto-generate a unique SKU: CAT-YYYYMMDD-XXX
+        date_str = datetime.date.today().strftime('%Y%m%d')
+        while True:
+            suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=3))
+            sku = f"CAT-{date_str}-{suffix}"
+            if not Producto.objects.filter(sku=sku).exists():
+                break
+
         try:
             producto = Producto.objects.create(
                 sku=sku,
                 nombre=nombre,
                 descripcion=data.get('desc', ''),
                 categoria=data.get('cat', 'Software'),
+                tipo_licencia=data.get('tipo_licencia', 'Comercial'),
                 precio=data.get('price') or 0,
                 moneda=data.get('currency', 'USD'),
                 unidad=data.get('unit', ''),
                 estado=data.get('status', 'Activo'),
+                datos_adicionales=data.get('datos_adicionales', {}),
             )
         except IntegrityError:
             raise DRFValidationError({'sku': 'Ya existe un producto con ese SKU.'})
@@ -94,6 +108,7 @@ class ProductoDetailView(APIView):
             ('sku', 'sku'), ('name', 'nombre'), ('desc', 'descripcion'),
             ('cat', 'categoria'), ('price', 'precio'), ('currency', 'moneda'),
             ('unit', 'unidad'), ('status', 'estado'),
+            ('tipo_licencia', 'tipo_licencia'), ('datos_adicionales', 'datos_adicionales'),
         ]:
             if campo_api in data:
                 setattr(producto, campo_modelo, data[campo_api])
