@@ -12,23 +12,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.CreateModel(
-            name='SystemConfig',
-            fields=[
-                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('default_currency', models.CharField(
-                    choices=[('CLP', 'Pesos Chilenos'), ('USD', 'Dólares'), ('EUR', 'Euros')],
-                    default='CLP',
-                    help_text='Moneda utilizada por defecto en el sistema (CLP, USD, EUR)',
-                    max_length=3,
-                    verbose_name='Moneda por defecto'
-                )),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
-                ('updated_at', models.DateTimeField(auto_now=True)),
-            ],
-            options={
-                'verbose_name': 'Configuración del Sistema',
-                'verbose_name_plural': 'Configuración del Sistema',
-            },
-        ),
     ]
+
