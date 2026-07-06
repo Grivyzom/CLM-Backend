@@ -99,10 +99,11 @@ def excel_a_clientes(archivo):
         tipo_raw = str(fila.get("tipo", "")).strip().lower()
         if "natural" in tipo_raw:
             tipo = "natural"
-        elif "juridica" in tipo_raw or "jurídica" in tipo_raw:
+        elif any(term in tipo_raw for term in ["juridica", "jurídica", "empresa", "juridico", "jurídico"]):
             tipo = "juridica"
         else:
             tipo = tipo_raw
+
 
         email = str(fila.get("email", "")).strip()
         telefono = str(fila.get("telefono", "")).strip() or None
