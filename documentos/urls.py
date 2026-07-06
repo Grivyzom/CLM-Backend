@@ -4,6 +4,7 @@ from . import views
 urlpatterns = [
     # ── Exportar ──────────────────────────────────────────────────────────────
     path("exportar/contratos/excel/", views.exportar_contratos_excel, name="exportar_contratos_excel"),
+    path("exportar/contratos/csv/", views.exportar_contratos_csv, name="exportar_contratos_csv"),
     path("exportar/clientes/excel/", views.exportar_clientes_excel, name="exportar_clientes_excel"),
     path("exportar/clientes/csv/", views.exportar_clientes_csv, name="exportar_clientes_csv"),
     path("exportar/contratos/pdf/", views.exportar_reporte_contratos_pdf, name="exportar_reporte_contratos_pdf"),

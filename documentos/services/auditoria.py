@@ -102,10 +102,19 @@ def describir_filtros_clientes(request):
 
 
 def describir_filtros_contratos(request):
-    """Resumen legible del recorte exportado (por ahora solo soporta selección
-    manual vía 'ids'; sin filtros de tabla aún porque no existe esa UI)."""
+    """Resumen legible del recorte exportado: selección manual, por cliente
+    (todos sus contratos) o por nomenclatura/nombre del contrato."""
     ids_param = request.GET.get('ids', '').strip()
     if ids_param:
         n = len([x for x in ids_param.split(',') if x.strip()])
         return f'Selección manual: {n} contrato(s)'
+
+    cliente_id = request.GET.get('cliente_id', '').strip()
+    if cliente_id:
+        return f'Todos los contratos del cliente ID {cliente_id}'
+
+    search = request.GET.get('search', '').strip()
+    if search:
+        return f"Búsqueda por nombre/código de contrato: '{search}'"
+
     return 'Sin filtros (todos los registros)'

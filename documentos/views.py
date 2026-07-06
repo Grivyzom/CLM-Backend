@@ -1,9 +1,11 @@
 import json
+import re
+from django.db.models import Q
 from django.http import HttpResponse, JsonResponse
 from django.views.decorators.http import require_http_methods
 from django.contrib.auth.decorators import login_required
 
-from contratos.models import Contrato
+from contratos.models import Contrato, TipoContrato
 from clientes.models import Cliente
 from clientes.views import get_filtered_clientes_unified
 from .services import exportar, importar
@@ -11,6 +13,15 @@ from .services.auditoria import (
     build_export_filename, build_audit_meta,
     describir_filtros_clientes, describir_filtros_contratos,
 )
+
+_CODIGO_CONTRATO_RE = re.compile(r'^\s*ctr-?0*(\d+)\s*$', re.IGNORECASE)
+
+
+def _parse_codigo_contrato(texto):
+    """Extrae el ID numérico de una nomenclatura estandarizada tipo 'CTR-000041'
+    (o variantes 'ctr41', '000041'). Devuelve None si no matchea el patrón."""
+    m = _CODIGO_CONTRATO_RE.match(texto or '')
+    return int(m.group(1)) if m else None
 
 
 def _clientes_filtrados_ordenados(request):
@@ -29,13 +40,45 @@ def _clientes_filtrados_ordenados(request):
 
 
 def _contratos_filtrados_queryset(request):
-    """Si viene 'ids' (csv de IDs, selección manual), filtra a solo esos contratos.
-    Si no, devuelve todos (aún no existe UI de filtros para la tabla de contratos)."""
+    """
+    Recorte a exportar, en orden de prioridad:
+      1. 'ids' (csv de IDs) — selección manual desde la tabla.
+      2. 'cliente_id' — TODOS los contratos vinculados a ese cliente (búsqueda
+         "por cliente": trae el historial contractual completo, no un match parcial).
+      3. 'search' — coincide contra la nomenclatura estandarizada del contrato
+         (ej. 'CTR-000041', también acepta '41' o 'ctr41') o su nombre (software
+         licenciado / tipo de contrato). No busca por cliente — para eso está
+         'cliente_id': mezclar ambos criterios en un solo texto es ambiguo.
+      4. Sin filtros: todos los registros.
+    """
     qs = Contrato.objects.all()
+
     ids_param = request.GET.get('ids', '').strip()
     if ids_param:
         ids = [int(x) for x in ids_param.split(',') if x.strip().isdigit()]
-        qs = qs.filter(id__in=ids)
+        return qs.filter(id__in=ids)
+
+    cliente_id = request.GET.get('cliente_id', '').strip()
+    if cliente_id.isdigit():
+        return qs.filter(cliente_id=int(cliente_id))
+
+    search = request.GET.get('search', '').strip()
+    if search:
+        codigo_id = _parse_codigo_contrato(search)
+        if codigo_id is not None:
+            return qs.filter(id=codigo_id)
+
+        tipos_matching = [
+            value for value, label in TipoContrato.choices
+            if search.lower() in label.lower()
+        ]
+        filtro = Q(software__nombre__icontains=search)
+        if search.isdigit():
+            filtro |= Q(id=int(search))
+        if tipos_matching:
+            filtro |= Q(tipo_contrato__in=tipos_matching)
+        return qs.filter(filtro)
+
     return qs
 
 
@@ -56,6 +99,17 @@ def exportar_contratos_excel(request):
         buf.read(),
         content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+    resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
+
+@login_required
+@require_http_methods(["GET"])
+def exportar_contratos_csv(request):
+    qs = _contratos_filtrados_queryset(request)
+    buf = exportar.contratos_a_csv(qs)
+    filename = build_export_filename("Contratos", request.user, "csv")
+    resp = HttpResponse(buf.read(), content_type="text/csv")
     resp["Content-Disposition"] = f'attachment; filename="{filename}"'
     return resp
 
@@ -170,7 +224,14 @@ def importar_clientes_excel(request):
     if not archivo:
         return JsonResponse({"error": "Se requiere campo 'archivo'"}, status=400)
 
+    import json
+    with open("/tmp/last_import.xlsx", "wb") as f:
+        for chunk in archivo.chunks():
+            f.write(chunk)
+    archivo.seek(0)
     resultado = importar.excel_a_clientes(archivo)
+    with open("/tmp/import_log.txt", "w") as f:
+        f.write(json.dumps(resultado, indent=2))
     return JsonResponse(resultado)
 
 

@@ -133,6 +133,37 @@ def contratos_a_excel(queryset, meta=None):
     return buf
 
 
+def contratos_a_csv(queryset):
+    """Exporta QuerySet de Contrato a CSV. Devuelve BytesIO (UTF-8 con BOM para Excel)."""
+    encabezados = [
+        "ID", "Cliente", "Software", "SLA",
+        "Tipo", "Estado", "Monto",
+        "Fecha Inicio", "Fecha Vencimiento", "Días Gracia",
+    ]
+
+    text_buf = io.StringIO()
+    writer = csv.writer(text_buf)
+    writer.writerow(encabezados)
+
+    for c in queryset.select_related('cliente', 'software', 'sla'):
+        writer.writerow([
+            c.id,
+            str(c.cliente),
+            c.software.nombre,
+            c.sla.nombre,
+            c.get_tipo_contrato_display(),
+            c.get_status_display(),
+            float(c.monto),
+            c.fecha_inicio,
+            c.fecha_vencimiento or "",
+            c.dias_gracia_autorizados,
+        ])
+
+    buf = io.BytesIO(b"\xef\xbb\xbf" + text_buf.getvalue().encode("utf-8"))
+    buf.seek(0)
+    return buf
+
+
 def clientes_a_excel(queryset, meta=None):
     """
     Exporta QuerySet de Cliente a Excel. Devuelve BytesIO.

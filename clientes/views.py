@@ -63,6 +63,7 @@ def get_filtered_clientes_unified(query_params):
     tipo_q      = query_params.get('tipo', 'Todos').strip()
     fecha_desde = query_params.get('fecha_desde', None)
     fecha_hasta = query_params.get('fecha_hasta', None)
+    ordering    = query_params.get('ordering', '').strip()
 
     # ── Querysets base ───────────────────────────────────────────────────
     pj_qs = PersonaJuridica.objects.all()
@@ -140,8 +141,55 @@ def get_filtered_clientes_unified(query_params):
                 'contacto': None,
             })
 
-    # Ordenar por fecha_registro desc
-    unified.sort(key=lambda x: x['fecha_registro'], reverse=True)
+    # Ordenar unificado por el campo indicado en ordering
+    if ordering:
+        reverse = ordering.startswith('-')
+        field = ordering.lstrip('-')
+
+        # Pre-cargar representantes si ordenamos por contacto
+        representatives_map = {}
+        if field == 'contacto':
+            pj_ids = [u['obj'].id for u in unified if u['tipo'] == 'juridica']
+            if pj_ids:
+                from .models import ContactoRepresentante
+                for cr in ContactoRepresentante.objects.filter(cliente_juridico_id__in=pj_ids):
+                    if cr.cliente_juridico_id not in representatives_map:
+                        representatives_map[cr.cliente_juridico_id] = cr.nombre
+
+        def get_sort_value(item):
+            obj = item['obj']
+            if field == 'razon_social':
+                val = obj.razon_social if item['tipo'] == 'juridica' else obj.nombre_completo
+            elif field == 'id_fiscal':
+                val = obj.rut if item['tipo'] == 'juridica' else obj.run
+            elif field == 'sector':
+                val = obj.giro if item['tipo'] == 'juridica' else 'Persona Natural'
+            elif field == 'contacto':
+                if item['tipo'] == 'juridica':
+                    val = representatives_map.get(obj.id, '')
+                else:
+                    val = obj.nombre_completo
+            elif field == 'tipo':
+                val = item['tipo']
+            elif field == 'estado':
+                val = item['estado']
+            elif field == 'contratos':
+                val = item['contratos_count']
+            elif field == 'fecha_registro':
+                val = item['fecha_registro']
+            else:
+                val = item['fecha_registro']
+
+            if isinstance(val, str):
+                return val.lower()
+            if val is None:
+                return ''
+            return val
+
+        unified.sort(key=get_sort_value, reverse=reverse)
+    else:
+        # Ordenar por fecha_registro desc por defecto
+        unified.sort(key=lambda x: x['fecha_registro'], reverse=True)
 
     # ── Filtro de estado (se aplica tras calcular) ───────────────────────
     if estado_q not in ('Todos', '', None):

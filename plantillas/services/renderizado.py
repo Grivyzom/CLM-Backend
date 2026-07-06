@@ -15,6 +15,16 @@ from docxtpl import DocxTemplate
 from jinja2 import Environment, StrictUndefined
 from jinja2.exceptions import TemplateError, UndefinedError
 
+class TolerantUndefined(StrictUndefined):
+    """
+    Permite el uso de variables como '____________' (líneas de firma) 
+    sin arrojar error, asumiendo que son espacios para completar a mano.
+    """
+    def __str__(self):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return self._undefined_name
+        return super().__str__()
+
 from .contexto import construir_contexto
 from ..models import DocumentoGenerado, PlantillaDocumento
 
@@ -39,9 +49,8 @@ def renderizar_docx(plantilla: PlantillaDocumento, contexto: dict) -> bytes:
     """Renderiza la plantilla .docx con el contexto dado. Devuelve los bytes del docx resultante."""
     try:
         doc = DocxTemplate(plantilla.archivo_docx.path)
-        # StrictUndefined: una variable no resuelta lanza error explícito en vez de
-        # dejar el placeholder vacío o silencioso en el documento final.
-        jinja_env = Environment(undefined=StrictUndefined)
+        # TolerantUndefined: permite '____________' pero falla si es otra variable no resuelta.
+        jinja_env = Environment(undefined=TolerantUndefined)
         doc.render(contexto, jinja_env=jinja_env)
     except UndefinedError as exc:
         raise VariablesFaltantesError(

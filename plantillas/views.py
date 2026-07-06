@@ -6,9 +6,10 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework import status
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 
 from contratos.models import Contrato, EtapaContrato
-from .models import PlantillaDocumento, DocumentoGenerado
+from .models import PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula
 from .services.validacion import validar_docx_subido
 from .services.renderizado import (
     generar_documento, resolver_plantilla_activa,
@@ -25,6 +26,8 @@ ETAPAS_CON_DOCUMENTO_EMITIDO = {
 
 
 def _plantilla_a_dict(p: PlantillaDocumento):
+    from .models import DocumentoGenerado
+    usos = DocumentoGenerado.objects.filter(plantilla=p).count()
     return {
         'id': p.id,
         'nombre': p.nombre,
@@ -33,6 +36,7 @@ def _plantilla_a_dict(p: PlantillaDocumento):
         'version_codigo': p.version_codigo,
         'activa': p.activa,
         'fecha_creacion': p.fecha_creacion,
+        'usos': usos,
     }
 
 
@@ -201,3 +205,90 @@ class DescargarDocxView(APIView):
             filename=f"contrato_{documento.contrato_id}_interno.docx",
             content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
+
+class ClausulaListView(APIView):
+    """
+    GET /api/plantillas/clausulas/
+    """
+    def get(self, request):
+        qs = Clausula.objects.prefetch_related('versiones').filter(activa=True)
+        data = []
+        for c in qs:
+            versions = [
+                {
+                    'id': v.id,
+                    'etiqueta': v.etiqueta,
+                    'tipo': v.tipo,
+                    'texto': v.texto,
+                } for v in c.versiones.all() if v.activa
+            ]
+            data.append({
+                'id': c.id,
+                'cat': c.categoria,
+                'name': c.nombre,
+                'risk': c.riesgo,
+                'versions': versions
+            })
+        return Response(data)
+
+    def post(self, request):
+        data = request.data
+        try:
+            with transaction.atomic():
+                clausula = Clausula.objects.create(
+                    categoria=data.get('cat', 'General'),
+                    nombre=data.get('name', 'Nueva Cláusula'),
+                    riesgo=data.get('risk', 'Medio'),
+                    activa=True
+                )
+                
+                versions_data = data.get('versions', [])
+                for v_data in versions_data:
+                    VersionClausula.objects.create(
+                        clausula=clausula,
+                        etiqueta=v_data.get('label', 'Estándar'),
+                        tipo=v_data.get('tag', 'Estándar'),
+                        texto=v_data.get('text', '')
+                    )
+            
+            return Response({'status': 'ok', 'id': clausula.id}, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ClausulaDetailView(APIView):
+    """
+    PUT /api/plantillas/clausulas/<pk>/
+    DELETE /api/plantillas/clausulas/<pk>/
+    """
+    def put(self, request, pk):
+        clausula = get_object_or_404(Clausula, pk=pk)
+        data = request.data
+        try:
+            with transaction.atomic():
+                clausula.categoria = data.get('cat', clausula.categoria)
+                clausula.nombre = data.get('name', clausula.nombre)
+                clausula.riesgo = data.get('risk', clausula.riesgo)
+                clausula.save()
+
+                # Reemplazar versiones: desactivar anteriores y crear nuevas
+                clausula.versiones.filter(activa=True).update(activa=False)
+                
+                versions_data = data.get('versions', [])
+                for v_data in versions_data:
+                    VersionClausula.objects.create(
+                        clausula=clausula,
+                        etiqueta=v_data.get('label', 'Estándar'),
+                        tipo=v_data.get('tag', 'Estándar'),
+                        texto=v_data.get('text', '')
+                    )
+            return Response({'status': 'ok'})
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            
+    def delete(self, request, pk):
+        clausula = get_object_or_404(Clausula, pk=pk)
+        # Soft delete
+        clausula.activa = False
+        clausula.save()
+        return Response({'status': 'deleted'})

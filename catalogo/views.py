@@ -5,7 +5,24 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.db import IntegrityError
 
-from .models import Producto
+from .models import Producto, Software
+
+
+def _software_a_dict(s):
+    return {
+        'id': s.id,
+        'nombre': s.nombre,
+        'slug': s.slug,
+    }
+
+
+class SoftwareListView(APIView):
+    """GET /api/catalogo/software/ — catálogo de productos de software (para selects)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Software.objects.all().order_by('nombre')
+        return Response([_software_a_dict(s) for s in qs])
 
 
 def _producto_a_dict(p):

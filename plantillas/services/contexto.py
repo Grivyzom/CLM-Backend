@@ -65,6 +65,24 @@ def construir_contexto(contrato):
     sla = contrato.sla
     software = contrato.software
 
+    # Cargar obligaciones del contrato
+    obligaciones_list = [
+        {
+            'tipo_obligacion': ob.tipo_obligacion,
+            'descripcion': ob.descripcion,
+            'penalizacion': ob.penalizacion,
+        }
+        for ob in contrato.obligaciones.all()
+    ]
+
+    clausula_enmienda = ""
+    if contrato.parent_contrato:
+        fecha_orig = contrato.parent_contrato.fecha_inicio.strftime("%d/%m/%Y") if contrato.parent_contrato.fecha_inicio else ""
+        clausula_enmienda = (
+            f"El presente Anexo modifica el Contrato Original [ID: {contrato.parent_contrato.id}], "
+            f"con fecha {fecha_orig}. Las siguientes obligaciones (SLA) se añaden o sustituyen a las anteriormente pactadas."
+        )
+
     return {
         'cliente': _contexto_cliente(contrato.cliente),
         'software': {
@@ -91,7 +109,12 @@ def construir_contexto(contrato):
             'fecha_inicio': contrato.fecha_inicio,
             'fecha_vencimiento': contrato.fecha_vencimiento,
             'dias_gracia_autorizados': contrato.dias_gracia_autorizados,
+            'version': contrato.version,
+            'parent_id': contrato.parent_contrato.id if contrato.parent_contrato else None,
+            'clausula_anexo':  clausula_enmienda,
         },
+        'clausula_anexo': clausula_enmienda,
+        'obligaciones': obligaciones_list,
         'terminos_legales': _contexto_terminos_legales(),
         'fecha_generacion': date.today(),
     }

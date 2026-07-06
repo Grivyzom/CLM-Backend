@@ -70,3 +70,47 @@ class DocumentoGenerado(models.Model):
 
     def __str__(self):
         return f"Documento contrato #{self.contrato_id} — {self.fecha_generacion:%Y-%m-%d %H:%M}"
+
+
+class Clausula(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    categoria = models.CharField(max_length=100)
+    nombre = models.CharField(max_length=200)
+    RIESGO_CHOICES = [
+        ('Alto', 'Alto'),
+        ('Medio', 'Medio'),
+        ('Bajo', 'Bajo'),
+    ]
+    riesgo = models.CharField(max_length=20, choices=RIESGO_CHOICES, default='Medio')
+    activa = models.BooleanField(default=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_modificacion = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'plantillas_clausula'
+        ordering = ['categoria', 'nombre']
+
+    def __str__(self):
+        return f"{self.nombre} ({self.categoria})"
+
+
+class VersionClausula(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    clausula = models.ForeignKey(Clausula, related_name='versiones', on_delete=models.CASCADE)
+    etiqueta = models.CharField(max_length=100)
+    
+    TIPO_CHOICES = [
+        ('Estándar', 'Estándar'),
+        ('Alternativa', 'Alternativa'),
+    ]
+    tipo = models.CharField(max_length=50, choices=TIPO_CHOICES, default='Estándar')
+    texto = models.TextField()
+    activa = models.BooleanField(default=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'plantillas_versionclausula'
+        ordering = ['id']
+
+    def __str__(self):
+        return f"{self.clausula.nombre} - {self.etiqueta}"

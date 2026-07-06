@@ -2,15 +2,24 @@ import calendar
 from datetime import date, timedelta
 from decimal import Decimal
 
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, Case, When, F, DecimalField
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework import status as http_status
 
 from catalogo.models import Software
 from clientes.models import Cliente
-from .models import Contrato, EstadoContrato, TipoContrato
+from plantillas.models import DocumentoGenerado
+from .models import (
+    Contrato, EstadoContrato, TipoContrato, FrecuenciaFacturacion,
+    EtapaContrato, SLA, HistorialEtapaContrato, ArchivoAdjunto,
+    ObligacionSLA, ObligacionSLAAuditLog,
+)
+from django.core.exceptions import ValidationError
 
 MESES_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
 DIAS_SEMANA_ES = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
@@ -193,3 +202,672 @@ class DashboardView(APIView):
             })
 
         return results
+
+
+def _sla_a_dict(s):
+    return {
+        'id': s.id,
+        'nombre': s.nombre,
+        'uptime_garantizado': str(s.uptime_garantizado),
+        'tiempo_respuesta_horas': s.tiempo_respuesta_horas,
+        'detalles': s.detalles or '',
+    }
+
+
+class SLAListView(APIView):
+    """GET /api/slas/ — catálogo de SLA (para selects y obligaciones de contrato)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = SLA.objects.all().order_by('nombre')
+        return Response([_sla_a_dict(s) for s in qs])
+
+
+# ─── Contratos: CRUD ──────────────────────────────────────────────────────────
+
+def _compute_mrr_arr(monto, tipo_contrato, frecuencia):
+    """MRR/ARR solo tienen sentido para contratos RECURRENTE. `monto` se interpreta
+    como el valor cobrado en cada ciclo de facturación (mensual o anual)."""
+    if tipo_contrato != TipoContrato.RECURRENTE or monto is None:
+        return Decimal('0'), Decimal('0')
+    if frecuencia == FrecuenciaFacturacion.ANUAL:
+        mrr = monto / Decimal('12')
+    else:
+        mrr = monto
+    return mrr, mrr * Decimal('12')
+
+
+def _dias_restantes(fecha_vencimiento, today):
+    if not fecha_vencimiento:
+        return None
+    return (fecha_vencimiento - today).days
+
+
+def _contrato_nombre(c):
+    tipo_label = c.get_tipo_contrato_display()
+    software_nombre = c.software.nombre if c.software_id else 's/software'
+    return f"{tipo_label} — {software_nombre}"
+
+
+def _contrato_list_dict(c, responsable_map, tiene_documento_ids, today):
+    mrr, arr = _compute_mrr_arr(c.monto, c.tipo_contrato, c.frecuencia_facturacion)
+    return {
+        'id': c.id,
+        'nombre': _contrato_nombre(c),
+        'cliente': {'id': c.cliente_id, 'nombre': str(c.cliente)},
+        'software': {'id': c.software_id, 'nombre': c.software.nombre if c.software_id else ''},
+        'sla': {'id': c.sla_id, 'nombre': c.sla.nombre if c.sla_id else ''},
+        'etapa': c.etapa,
+        'etapa_display': c.get_etapa_display(),
+        'status': c.status,
+        'status_display': c.get_status_display(),
+        'tipo_contrato': c.tipo_contrato,
+        'tipo_contrato_display': c.get_tipo_contrato_display(),
+        'monto': str(c.monto),
+        'frecuencia_facturacion': c.frecuencia_facturacion,
+        'mrr': str(mrr),
+        'arr': str(arr),
+        'fecha_inicio': c.fecha_inicio,
+        'fecha_vencimiento': c.fecha_vencimiento,
+        'fecha_creacion': c.fecha_creacion,
+        'dias_restantes': _dias_restantes(c.fecha_vencimiento, today),
+        'responsable': responsable_map.get(c.id, ''),
+        'tiene_documento': c.id in tiene_documento_ids,
+    }
+
+
+def _build_responsable_map(contrato_ids):
+    """Responsable = usuario que registró la creación inicial del contrato (historial)."""
+    entradas = (
+        HistorialEtapaContrato.objects
+        .filter(contrato_id__in=contrato_ids, etapa_anterior__isnull=True)
+        .select_related('usuario')
+    )
+    return {
+        e.contrato_id: (e.usuario.get_full_name() or e.usuario.username) if e.usuario_id else ''
+        for e in entradas
+    }
+
+
+class ContratoListCreateView(APIView):
+    """
+    GET /api/contratos/?search=&etapa=&software=&page=&page_size=
+    Lista paginada de contratos con datos reales (para tabla/kanban de Contratos).
+
+    POST /api/contratos/
+    Crea un nuevo contrato en etapa BORRADOR.
+    Body: { cliente_id, software_id, sla_id, tipo_contrato, monto, fecha_inicio,
+            fecha_vencimiento?, frecuencia_facturacion? (requerido si tipo_contrato=RECURRENTE),
+            dias_gracia_autorizados? }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+            page_size = min(100, max(1, int(request.query_params.get('page_size', 20))))
+        except (ValueError, TypeError):
+            page, page_size = 1, 20
+
+        qs = Contrato.objects.select_related('cliente', 'software', 'sla').all()
+
+        search = request.query_params.get('search', '').strip()
+        if search:
+            qs = qs.filter(
+                Q(id__icontains=search) |
+                Q(cliente__personanatural__nombre_completo__icontains=search) |
+                Q(cliente__personajuridica__razon_social__icontains=search) |
+                Q(cliente__email_principal__icontains=search) |
+                Q(software__nombre__icontains=search)
+            )
+
+        etapa = request.query_params.get('etapa', 'Todos')
+        if etapa and etapa != 'Todos':
+            qs = qs.filter(etapa=etapa)
+
+        software_id = request.query_params.get('software')
+        if software_id:
+            qs = qs.filter(software_id=software_id)
+
+        ordering = request.query_params.get('ordering', '').strip()
+        if ordering:
+            reverse = ordering.startswith('-')
+            field = ordering.lstrip('-')
+
+            if field == 'id':
+                qs = qs.order_by('-id' if reverse else 'id')
+            elif field == 'contrato':
+                qs = qs.order_by('-tipo_contrato' if reverse else 'tipo_contrato', '-software__nombre' if reverse else 'software__nombre')
+            elif field == 'cliente':
+                from django.db.models.functions import Coalesce
+                qs = qs.annotate(cliente_name=Coalesce('cliente__personajuridica__razon_social', 'cliente__personanatural__nombre_completo'))
+                qs = qs.order_by('-cliente_name' if reverse else 'cliente_name')
+            elif field == 'software':
+                qs = qs.order_by('-software__nombre' if reverse else 'software__nombre')
+            elif field == 'etapa':
+                qs = qs.order_by('-etapa' if reverse else 'etapa')
+            elif field == 'mrr':
+                qs = qs.order_by('-monto' if reverse else 'monto')
+            elif field == 'facturacion':
+                qs = qs.order_by('-frecuencia_facturacion' if reverse else 'frecuencia_facturacion')
+            elif field == 'renovacion':
+                qs = qs.order_by('-fecha_vencimiento' if reverse else 'fecha_vencimiento')
+            elif field == 'responsable':
+                from django.db.models import Subquery, OuterRef, Value
+                from django.db.models.functions import Concat
+                from .models import HistorialEtapaContrato
+                initial_history = HistorialEtapaContrato.objects.filter(
+                    contrato=OuterRef('pk'), etapa_anterior__isnull=True
+                )
+                creator_fullname = Subquery(
+                    initial_history.annotate(
+                        full_name=Concat('usuario__first_name', Value(' '), 'usuario__last_name')
+                    ).values('full_name')[:1]
+                )
+                qs = qs.annotate(responsable_name=creator_fullname).order_by('-responsable_name' if reverse else 'responsable_name')
+            else:
+                qs = qs.order_by('-fecha_creacion')
+        else:
+            qs = qs.order_by('-fecha_creacion')
+
+        total = qs.count()
+        offset = (page - 1) * page_size
+        page_items = list(qs[offset: offset + page_size])
+
+        today = timezone.localdate()
+        ids = [c.id for c in page_items]
+        responsable_map = _build_responsable_map(ids)
+        tiene_documento_ids = set(
+            DocumentoGenerado.objects.filter(contrato_id__in=ids)
+            .values_list('contrato_id', flat=True).distinct()
+        )
+
+        results = [_contrato_list_dict(c, responsable_map, tiene_documento_ids, today) for c in page_items]
+
+        return Response({
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': max(1, -(-total // page_size)),
+            'results': results,
+        })
+
+    def post(self, request):
+        data = request.data
+
+        cliente_id = data.get('cliente_id')
+        software_id = data.get('software_id')
+        sla_id = data.get('sla_id')
+        tipo_contrato = data.get('tipo_contrato')
+        fecha_inicio = data.get('fecha_inicio')
+
+        errors = {}
+        if not cliente_id:
+            errors['cliente_id'] = 'Este campo es requerido.'
+        if not software_id:
+            errors['software_id'] = 'Este campo es requerido.'
+        if not sla_id:
+            errors['sla_id'] = 'Este campo es requerido.'
+        if tipo_contrato not in TipoContrato.values:
+            errors['tipo_contrato'] = 'Tipo de contrato inválido.'
+        if not fecha_inicio:
+            errors['fecha_inicio'] = 'Este campo es requerido.'
+
+        frecuencia = data.get('frecuencia_facturacion') or None
+        if tipo_contrato == TipoContrato.RECURRENTE:
+            if not frecuencia:
+                errors['frecuencia_facturacion'] = 'Requerido para contratos recurrentes.'
+            elif frecuencia not in FrecuenciaFacturacion.values:
+                errors['frecuencia_facturacion'] = 'Frecuencia de facturación inválida.'
+        else:
+            frecuencia = None
+
+        if errors:
+            raise DRFValidationError(errors)
+
+        if not Cliente.objects.filter(pk=cliente_id).exists():
+            raise DRFValidationError({'cliente_id': 'Cliente no encontrado.'})
+        if not Software.objects.filter(pk=software_id).exists():
+            raise DRFValidationError({'software_id': 'Software no encontrado.'})
+        if not SLA.objects.filter(pk=sla_id).exists():
+            raise DRFValidationError({'sla_id': 'SLA no encontrado.'})
+
+        try:
+            from django.db import transaction
+            with transaction.atomic():
+                contrato = Contrato.objects.create(
+                    cliente_id=cliente_id,
+                    software_id=software_id,
+                    sla_id=sla_id,
+                    tipo_contrato=tipo_contrato,
+                    monto=data.get('monto') or 0,
+                    frecuencia_facturacion=frecuencia,
+                    fecha_inicio=fecha_inicio,
+                    fecha_vencimiento=data.get('fecha_vencimiento') or None,
+                    dias_gracia_autorizados=data.get('dias_gracia_autorizados') or 0,
+                )
+                
+                # Seed default obligations
+                ObligacionSLA.objects.create(
+                    contrato=contrato,
+                    tipo_obligacion="Disponibilidad de plataforma",
+                    descripcion=f"Garantizar un {contrato.sla.uptime_garantizado}% de tiempo en línea mensual",
+                    penalizacion="Descuento del 10% en la siguiente factura si no se cumple"
+                )
+                ObligacionSLA.objects.create(
+                    contrato=contrato,
+                    tipo_obligacion="Tiempo de respuesta soporte",
+                    descripcion=f"Tiempo de respuesta máximo de {contrato.sla.tiempo_respuesta_horas} horas para incidentes",
+                    penalizacion="Compensación según acuerdo comercial"
+                )
+        except Exception as e:
+            raise DRFValidationError({'error': str(e)})
+
+        # Los campos numéricos/fecha llegan como strings del JSON; el atributo en
+        # memoria no se recasta hasta refrescar desde la BD (Decimal, date, etc.).
+        contrato.refresh_from_db()
+
+        HistorialEtapaContrato.objects.create(
+            contrato=contrato,
+            etapa_anterior=None,
+            etapa_nueva=contrato.etapa,
+            usuario=request.user,
+            notas='Creación inicial desde el CLM',
+        )
+
+        return Response(_contrato_detail_dict(contrato), status=http_status.HTTP_201_CREATED)
+
+
+def _contrato_detail_dict(c):
+    today = timezone.localdate()
+    mrr, arr = _compute_mrr_arr(c.monto, c.tipo_contrato, c.frecuencia_facturacion)
+
+    historial = [
+        {
+            'fecha': h.fecha_cambio,
+            'actor': (h.usuario.get_full_name() or h.usuario.username) if h.usuario_id else 'Sistema',
+            'etapa_anterior': h.etapa_anterior,
+            'etapa_nueva': h.etapa_nueva,
+            'etapa_nueva_display': h.get_etapa_nueva_display(),
+            'notas': h.notas or '',
+        }
+        for h in c.historial_etapas.select_related('usuario').order_by('fecha_cambio')
+    ]
+
+    documentos = [
+        {
+            'id': d.id,
+            'plantilla_version': d.plantilla.version_codigo,
+            'hash_sha256': d.hash_sha256,
+            'fecha_generacion': d.fecha_generacion,
+        }
+        for d in c.documentos_generados.select_related('plantilla').order_by('-fecha_generacion')
+    ]
+
+    anexos = [
+        {
+            'id': a.id,
+            'nombre': a.nombre,
+            'descripcion': a.descripcion or '',
+            'fecha_subida': a.fecha_subida,
+            'archivo': a.archivo.url if a.archivo else None,
+        }
+        for a in c.archivos.order_by('-fecha_subida')
+    ]
+
+    obs = list(c.obligaciones.all().order_by('id'))
+    if obs:
+        obligaciones = [
+            {
+                'id': ob.id,
+                'tipo_obligacion': ob.tipo_obligacion,
+                'descripcion': ob.descripcion,
+                'penalizacion': ob.penalizacion,
+            }
+            for ob in obs
+        ]
+    else:
+        obligaciones = []
+        if c.sla_id:
+            obligaciones = [
+                {
+                    'id': None,
+                    'tipo_obligacion': 'Disponibilidad de plataforma',
+                    'descripcion': f"{c.sla.uptime_garantizado}% mensual",
+                    'penalizacion': 'No especificada',
+                },
+                {
+                    'id': None,
+                    'tipo_obligacion': 'Tiempo de respuesta soporte',
+                    'descripcion': f"< {c.sla.tiempo_respuesta_horas}h",
+                    'penalizacion': 'No especificada',
+                },
+            ]
+
+    # Versiones
+    root = c.parent_contrato if c.parent_contrato else c
+    siblings = Contrato.objects.filter(Q(id=root.id) | Q(parent_contrato=root)).order_by('version')
+    versiones = [
+        {
+            'id': sib.id,
+            'version': sib.version,
+            'etapa': sib.etapa,
+            'etapa_display': sib.get_etapa_display(),
+            'fecha_creacion': sib.fecha_creacion,
+        }
+        for sib in siblings
+    ]
+
+    responsable_map = _build_responsable_map([c.id])
+
+    return {
+        'id': c.id,
+        'nombre': _contrato_nombre(c),
+        'cliente': {'id': c.cliente_id, 'nombre': str(c.cliente), 'email': c.cliente.email_principal},
+        'software': {'id': c.software_id, 'nombre': c.software.nombre if c.software_id else ''},
+        'sla': {'id': c.sla_id, 'nombre': c.sla.nombre if c.sla_id else ''},
+        'etapa': c.etapa,
+        'etapa_display': c.get_etapa_display(),
+        'status': c.status,
+        'status_display': c.get_status_display(),
+        'tipo_contrato': c.tipo_contrato,
+        'tipo_contrato_display': c.get_tipo_contrato_display(),
+        'monto': str(c.monto),
+        'frecuencia_facturacion': c.frecuencia_facturacion,
+        'mrr': str(mrr),
+        'arr': str(arr),
+        'fecha_inicio': c.fecha_inicio,
+        'fecha_vencimiento': c.fecha_vencimiento,
+        'fecha_creacion': c.fecha_creacion,
+        'dias_gracia_autorizados': c.dias_gracia_autorizados,
+        'fin_periodo_gracia': c.fin_periodo_gracia,
+        'dias_restantes': _dias_restantes(c.fecha_vencimiento, today),
+        'responsable': responsable_map.get(c.id, ''),
+        'historial': historial,
+        'documentos': documentos,
+        'anexos': anexos,
+        'obligaciones_sla': obligaciones,
+        'version': c.version,
+        'parent_contrato_id': c.parent_contrato_id,
+        'versiones': versiones,
+    }
+
+
+class ContratoDetailView(APIView):
+    """
+    GET    /api/contratos/<id>/   — detalle completo (historial, documentos, anexos, SLA)
+    PATCH  /api/contratos/<id>/   — actualiza campos comerciales o transiciona etapa
+    DELETE /api/contratos/<id>/   — solo permitido en etapa BORRADOR
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        c = get_object_or_404(
+            Contrato.objects.select_related('cliente', 'software', 'sla'), pk=pk
+        )
+        return Response(_contrato_detail_dict(c))
+
+    def patch(self, request, pk):
+        c = get_object_or_404(Contrato.objects.select_related('cliente', 'software', 'sla'), pk=pk)
+        data = request.data
+
+        nueva_etapa = data.get('etapa')
+        if nueva_etapa:
+            if nueva_etapa not in EtapaContrato.values:
+                raise DRFValidationError({'etapa': 'Etapa inválida.'})
+            c.transicionar_etapa(nueva_etapa, usuario=request.user, notas=data.get('notas', ''))
+
+        campo_simple = [
+            'monto', 'status', 'sla_id', 'fecha_vencimiento',
+            'dias_gracia_autorizados', 'frecuencia_facturacion',
+        ]
+        dirty = False
+        for campo in campo_simple:
+            if campo in data:
+                setattr(c, campo, data[campo])
+                dirty = True
+        if dirty:
+            c.save()
+
+        return Response(_contrato_detail_dict(c))
+
+    def delete(self, request, pk):
+        c = get_object_or_404(Contrato, pk=pk)
+        if c.etapa != EtapaContrato.BORRADOR:
+            return Response(
+                {'error': 'Solo se pueden eliminar contratos en etapa Borrador.'},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
+        c.delete()
+        return Response(status=http_status.HTTP_204_NO_CONTENT)
+
+
+class ContratoStatsView(APIView):
+    """GET /api/contratos/stats/ — KPIs para el StatsStrip de la vista Contratos."""
+    permission_classes = [IsAuthenticated]
+
+    PIPELINE_ETAPAS = [
+        EtapaContrato.BORRADOR, EtapaContrato.REVISION,
+        EtapaContrato.APROBADO, EtapaContrato.PENDIENTE_FIRMA,
+    ]
+
+    def get(self, request):
+        today = timezone.localdate()
+
+        activos = Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+        contratos_activos = activos.count()
+
+        # Agregación en SQL (evita traer miles de filas a Python).
+        mrr_expr = Case(
+            When(frecuencia_facturacion=FrecuenciaFacturacion.ANUAL, then=F('monto') / Decimal('12')),
+            default=F('monto'),
+            output_field=DecimalField(max_digits=15, decimal_places=4),
+        )
+        mrr_total = activos.filter(tipo_contrato=TipoContrato.RECURRENTE).aggregate(
+            total=Sum(mrr_expr)
+        )['total'] or Decimal('0')
+        arr_total = mrr_total * Decimal('12')
+
+        por_renovar = Contrato.objects.filter(
+            status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA],
+            fecha_vencimiento__gte=today,
+            fecha_vencimiento__lte=today + timedelta(days=60),
+        ).count()
+
+        en_pipeline = Contrato.objects.filter(etapa__in=self.PIPELINE_ETAPAS).count()
+
+        return Response({
+            'contratos_activos': contratos_activos,
+            'mrr_total': str(mrr_total),
+            'arr_total': str(arr_total),
+            'por_renovar': por_renovar,
+            'en_pipeline': en_pipeline,
+        })
+
+
+class ObligacionListCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, contrato_id):
+        contrato = get_object_or_404(Contrato, pk=contrato_id)
+        obs = contrato.obligaciones.all().order_by('id')
+        data = [
+            {
+                'id': ob.id,
+                'tipo_obligacion': ob.tipo_obligacion,
+                'descripcion': ob.descripcion,
+                'penalizacion': ob.penalizacion,
+            }
+            for ob in obs
+        ]
+        return Response(data)
+
+    def post(self, request, contrato_id):
+        contrato = get_object_or_404(Contrato, pk=contrato_id)
+        if contrato.etapa != EtapaContrato.BORRADOR:
+            return Response(
+                {'error': 'No se pueden añadir obligaciones a un contrato que no esté en estado Borrador.'},
+                status=http_status.HTTP_400_BAD_REQUEST
+            )
+        
+        data = request.data
+        tipo_obligacion = data.get('tipo_obligacion')
+        descripcion = data.get('descripcion')
+        penalizacion = data.get('penalizacion')
+
+        if not tipo_obligacion or not descripcion or not penalizacion:
+            return Response(
+                {'error': 'Todos los campos (tipo_obligacion, descripcion, penalizacion) son requeridos.'},
+                status=http_status.HTTP_400_BAD_REQUEST
+            )
+
+        ob = ObligacionSLA(
+            contrato=contrato,
+            tipo_obligacion=tipo_obligacion,
+            descripcion=descripcion,
+            penalizacion=penalizacion
+        )
+        try:
+            ob.save(usuario=request.user)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'id': ob.id,
+            'tipo_obligacion': ob.tipo_obligacion,
+            'descripcion': ob.descripcion,
+            'penalizacion': ob.penalizacion,
+        }, status=http_status.HTTP_201_CREATED)
+
+
+class ObligacionDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        ob = get_object_or_404(ObligacionSLA, pk=pk)
+        if ob.contrato.etapa != EtapaContrato.BORRADOR:
+            return Response(
+                {'error': 'No se pueden editar obligaciones de un contrato que no esté en estado Borrador.'},
+                status=http_status.HTTP_400_BAD_REQUEST
+            )
+        
+        data = request.data
+        if 'tipo_obligacion' in data:
+            ob.tipo_obligacion = data['tipo_obligacion']
+        if 'descripcion' in data:
+            ob.descripcion = data['descripcion']
+        if 'penalizacion' in data:
+            ob.penalizacion = data['penalizacion']
+
+        try:
+            ob.save(usuario=request.user)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'id': ob.id,
+            'tipo_obligacion': ob.tipo_obligacion,
+            'descripcion': ob.descripcion,
+            'penalizacion': ob.penalizacion,
+        })
+
+    def delete(self, request, pk):
+        ob = get_object_or_404(ObligacionSLA, pk=pk)
+        if ob.contrato.etapa != EtapaContrato.BORRADOR:
+            return Response(
+                {'error': 'No se pueden eliminar obligaciones de un contrato que no esté en estado Borrador.'},
+                status=http_status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            ob.delete(usuario=request.user)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        return Response(status=http_status.HTTP_204_NO_CONTENT)
+
+
+class ObligacionHistorialView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        logs = ObligacionSLAAuditLog.objects.filter(obligacion_id=pk).order_by('-fecha_cambio')
+        data = [
+            {
+                'id': log.id,
+                'fecha': log.fecha_cambio,
+                'usuario': log.actor_nombre,
+                'accion': log.accion,
+                'valor_anterior': log.valor_anterior,
+                'valor_nuevo': log.valor_nuevo,
+            }
+            for log in logs
+        ]
+        return Response(data)
+
+
+class ContratoEnmendarView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        contrato = get_object_or_404(Contrato, pk=pk)
+        
+        from django.db import transaction
+        with transaction.atomic():
+            root = contrato.parent_contrato if contrato.parent_contrato else contrato
+            num_versions = Contrato.objects.filter(parent_contrato=root).count()
+            next_version = f"{num_versions + 2}.0"
+            
+            nuevo_contrato = Contrato.objects.create(
+                cliente=contrato.cliente,
+                software=contrato.software,
+                sla=contrato.sla,
+                etapa=EtapaContrato.BORRADOR,
+                tipo_contrato=contrato.tipo_contrato,
+                status=contrato.status,
+                monto=contrato.monto,
+                frecuencia_facturacion=contrato.frecuencia_facturacion,
+                fecha_inicio=contrato.fecha_inicio,
+                fecha_vencimiento=contrato.fecha_vencimiento,
+                dias_gracia_autorizados=contrato.dias_gracia_autorizados,
+                fin_periodo_gracia=contrato.fin_periodo_gracia,
+                parent_contrato=root,
+                version=next_version
+            )
+            
+            obs = list(contrato.obligaciones.all())
+            if obs:
+                for ob in obs:
+                    nueva_ob = ObligacionSLA(
+                        contrato=nuevo_contrato,
+                        tipo_obligacion=ob.tipo_obligacion,
+                        descripcion=ob.descripcion,
+                        penalizacion=ob.penalizacion
+                    )
+                    nueva_ob.save(usuario=request.user)
+            else:
+                # Create default obligations for the cloned contract
+                if contrato.sla_id:
+                    ObligacionSLA.objects.create(
+                        contrato=nuevo_contrato,
+                        tipo_obligacion="Disponibilidad de plataforma",
+                        descripcion=f"Garantizar un {contrato.sla.uptime_garantizado}% de tiempo en línea mensual",
+                        penalizacion="Descuento del 10% en la siguiente factura si no se cumple"
+                    )
+                    ObligacionSLA.objects.create(
+                        contrato=nuevo_contrato,
+                        tipo_obligacion="Tiempo de respuesta soporte",
+                        descripcion=f"Tiempo de respuesta máximo de {contrato.sla.tiempo_respuesta_horas} horas para incidentes",
+                        penalizacion="Compensación según acuerdo comercial"
+                    )
+            
+            # Log in history
+            HistorialEtapaContrato.objects.create(
+                contrato=nuevo_contrato,
+                etapa_anterior=None,
+                etapa_nueva=EtapaContrato.BORRADOR,
+                usuario=request.user,
+                notas=f"Creado como enmienda / versión {next_version} a partir del contrato {contrato.id}"
+            )
+            
+        return Response(_contrato_detail_dict(nuevo_contrato), status=http_status.HTTP_201_CREATED)

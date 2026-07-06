@@ -2,6 +2,7 @@ from django.db import models
 from django.db.models import CheckConstraint, Q, F
 from core.middleware import ThreadLocalContext
 from django.conf import settings
+from django.core.exceptions import ValidationError
 
 class SoftwareScopedManager(models.Manager):
     def get_queryset(self):
@@ -43,6 +44,10 @@ class EstadoContrato(models.TextChoices):
     SUSPENDIDO = 'SUSPENDIDO', 'Suspendido'
     VENCIDO = 'VENCIDO', 'Vencido'
 
+class FrecuenciaFacturacion(models.TextChoices):
+    MENSUAL = 'MENSUAL', 'Mensual'
+    ANUAL = 'ANUAL', 'Anual'
+
 class EtapaContrato(models.TextChoices):
     BORRADOR = 'BORRADOR', 'Borrador (Draft)'
     REVISION = 'REVISION', 'En Revisión / Negociación'
@@ -63,11 +68,16 @@ class Contrato(models.Model):
     tipo_contrato = models.CharField(max_length=30, choices=TipoContrato.choices)
     status = models.CharField(max_length=30, choices=EstadoContrato.choices, default=EstadoContrato.ACTIVO)
     monto = models.DecimalField(max_digits=15, decimal_places=4, default=0.0000)
-    
+    frecuencia_facturacion = models.CharField(max_length=10, choices=FrecuenciaFacturacion.choices, null=True, blank=True)
+
     fecha_inicio = models.DateField()
     fecha_vencimiento = models.DateField(null=True, blank=True)
     dias_gracia_autorizados = models.IntegerField(default=0)
     fin_periodo_gracia = models.DateField(null=True, blank=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    version = models.CharField(max_length=10, default="1.0")
+    parent_contrato = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='versiones_hijas', db_column='parent_contrato_id')
 
     objects = models.Manager()
     scoped_objects = SoftwareScopedManager()
@@ -90,7 +100,11 @@ class Contrato(models.Model):
             CheckConstraint(
                 check=Q(dias_gracia_autorizados__gte=0),
                 name='chk_dias_gracia_positivos'
-            )
+            ),
+            CheckConstraint(
+                check=Q(frecuencia_facturacion__isnull=True) | Q(tipo_contrato=TipoContrato.RECURRENTE),
+                name='chk_frecuencia_solo_recurrente'
+            ),
         ]
 
     def transicionar_etapa(self, nueva_etapa, usuario=None, notas=""):
@@ -150,3 +164,87 @@ class ArchivoAdjunto(models.Model):
 
     def __str__(self):
         return self.nombre
+
+
+class ObligacionSLA(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE, related_name='obligaciones', db_column='contrato_id')
+    tipo_obligacion = models.CharField(max_length=100)
+    descripcion = models.TextField()
+    penalizacion = models.TextField()
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'contratos_obligacion_sla'
+
+    def save(self, *args, usuario=None, bypass_etapa_check=False, **kwargs):
+        if not bypass_etapa_check and self.contrato.etapa != EtapaContrato.BORRADOR:
+            raise ValidationError("No se pueden modificar obligaciones de un contrato que no esté en estado Borrador.")
+        
+        is_create = self.pk is None
+        if not is_create:
+            old = ObligacionSLA.objects.get(pk=self.pk)
+            valor_anterior = f"Tipo: {old.tipo_obligacion} | Métrica: {old.descripcion} | Penalización: {old.penalizacion}"
+        else:
+            valor_anterior = ""
+            
+        super().save(*args, **kwargs)
+        
+        valor_nuevo = f"Tipo: {self.tipo_obligacion} | Métrica: {self.descripcion} | Penalización: {self.penalizacion}"
+        
+        actor_name = "Sistema"
+        if usuario:
+            actor_name = usuario.get_full_name() or usuario.username
+        
+        ObligacionSLAAuditLog.objects.create(
+            contrato=self.contrato,
+            obligacion_id=self.id,
+            tipo_obligacion=self.tipo_obligacion,
+            usuario=usuario,
+            actor_nombre=actor_name,
+            accion='CREAR' if is_create else 'EDITAR',
+            valor_anterior=valor_anterior,
+            valor_nuevo=valor_nuevo
+        )
+
+    def delete(self, *args, usuario=None, bypass_etapa_check=False, **kwargs):
+        if not bypass_etapa_check and self.contrato.etapa != EtapaContrato.BORRADOR:
+            raise ValidationError("No se pueden eliminar obligaciones de un contrato que no esté en estado Borrador.")
+        
+        valor_anterior = f"Tipo: {self.tipo_obligacion} | Métrica: {self.descripcion} | Penalización: {self.penalizacion}"
+        contrato = self.contrato
+        tipo_ob = self.tipo_obligacion
+        ob_id = self.id
+        
+        actor_name = "Sistema"
+        if usuario:
+            actor_name = usuario.get_full_name() or usuario.username
+            
+        super().delete(*args, **kwargs)
+        
+        ObligacionSLAAuditLog.objects.create(
+            contrato=contrato,
+            obligacion_id=ob_id,
+            tipo_obligacion=tipo_ob,
+            usuario=usuario,
+            actor_nombre=actor_name,
+            accion='ELIMINAR',
+            valor_anterior=valor_anterior,
+            valor_nuevo=""
+        )
+
+
+class ObligacionSLAAuditLog(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE, related_name='obligaciones_audit_logs', db_column='contrato_id')
+    obligacion_id = models.IntegerField(null=True, blank=True)
+    tipo_obligacion = models.CharField(max_length=100)
+    usuario = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, db_column='usuario_id')
+    actor_nombre = models.CharField(max_length=150, default="Sistema")
+    fecha_cambio = models.DateTimeField(auto_now_add=True)
+    accion = models.CharField(max_length=10)
+    valor_anterior = models.TextField(blank=True, null=True)
+    valor_nuevo = models.TextField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'contratos_obligacionsla_auditlog'
