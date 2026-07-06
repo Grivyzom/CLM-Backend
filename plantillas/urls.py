@@ -10,6 +10,9 @@ urlpatterns = [
     path("documentos/<int:pk>/pdf/", views.DescargarPDFView.as_view(), name="documentos_pdf"),
     path("documentos/<int:pk>/docx/", views.DescargarDocxView.as_view(), name="documentos_docx"),
 
+    path("emitidos/", views.EmitidosListView.as_view(), name="emitidos_list"),
+
     path("clausulas/", views.ClausulaListView.as_view(), name="clausulas_list"),
     path("clausulas/<int:pk>/", views.ClausulaDetailView.as_view(), name="clausula_detail"),
 ]
+

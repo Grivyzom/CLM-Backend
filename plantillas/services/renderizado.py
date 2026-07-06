@@ -25,6 +25,41 @@ class TolerantUndefined(StrictUndefined):
             return self._undefined_name
         return super().__str__()
 
+    def __html__(self):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return self._undefined_name
+        return super().__html__()
+
+    def __bool__(self):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return False
+        return super().__bool__()
+
+    def __getattr__(self, name):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return self
+        return super().__getattr__(name)
+
+    def __getitem__(self, key):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return self
+        return super().__getitem__(key)
+
+    def __call__(self, *args, **kwargs):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return self
+        return super().__call__(*args, **kwargs)
+
+    def __iter__(self):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return iter([])
+        return super().__iter__()
+
+    def __len__(self):
+        if self._undefined_name and self._undefined_name.startswith('___'):
+            return 0
+        return super().__len__()
+
 from .contexto import construir_contexto
 from ..models import DocumentoGenerado, PlantillaDocumento
 

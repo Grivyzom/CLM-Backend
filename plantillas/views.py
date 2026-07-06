@@ -2,14 +2,14 @@ from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework import status
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 
 from contratos.models import Contrato, EtapaContrato
-from .models import PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula
+from .models import PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula, ModoOrigenPlantilla
 from .services.validacion import validar_docx_subido
 from .services.renderizado import (
     generar_documento, resolver_plantilla_activa,
@@ -32,7 +32,11 @@ def _plantilla_a_dict(p: PlantillaDocumento):
         'id': p.id,
         'nombre': p.nombre,
         'tipo_contrato': p.tipo_contrato,
+        'tipo_contrato_display': dict(p._meta.get_field('tipo_contrato').choices or {}).get(p.tipo_contrato, p.tipo_contrato),
         'software_id': p.software_id,
+        'software_nombre': p.software.nombre if p.software_id else None,
+        'modo_origen': p.modo_origen,
+        'modo_origen_display': p.get_modo_origen_display(),
         'version_codigo': p.version_codigo,
         'activa': p.activa,
         'fecha_creacion': p.fecha_creacion,
@@ -61,40 +65,58 @@ class PlantillaListCreateView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request):
-        qs = PlantillaDocumento.objects.all()
+        qs = PlantillaDocumento.objects.select_related('software').all()
         tipo_contrato = request.GET.get('tipo_contrato')
         software_id = request.GET.get('software')
         activa = request.GET.get('activa')
+        modo_origen = request.GET.get('modo_origen')
         if tipo_contrato:
             qs = qs.filter(tipo_contrato=tipo_contrato)
         if software_id:
             qs = qs.filter(software_id=software_id)
         if activa is not None:
             qs = qs.filter(activa=activa.lower() in ('1', 'true', 'si'))
+        if modo_origen:
+            qs = qs.filter(modo_origen=modo_origen)
         return Response([_plantilla_a_dict(p) for p in qs])
 
     def post(self, request):
-        archivo = request.FILES.get('archivo_docx')
-        if not archivo:
-            raise DRFValidationError({'archivo_docx': 'Este campo es requerido.'})
-        try:
-            validar_docx_subido(archivo)
-        except DjangoValidationError as exc:
-            raise DRFValidationError({'archivo_docx': exc.messages})
-
         nombre = request.data.get('nombre')
         tipo_contrato = request.data.get('tipo_contrato')
         version_codigo = request.data.get('version_codigo')
-        if not (nombre and tipo_contrato and version_codigo):
-            raise DRFValidationError('nombre, tipo_contrato y version_codigo son requeridos.')
-
         software_id = request.data.get('software') or None
+        modo_origen = request.data.get('modo_origen', ModoOrigenPlantilla.ARCHIVO)
+
+        errors = {}
+        if not nombre:
+            errors['nombre'] = 'Este campo es requerido.'
+        if not tipo_contrato:
+            errors['tipo_contrato'] = 'Este campo es requerido.'
+        if not version_codigo:
+            errors['version_codigo'] = 'Este campo es requerido.'
+        if not software_id:
+            errors['software'] = 'Debe especificar a qué software/producto pertenece esta plantilla.'
+        if modo_origen not in ModoOrigenPlantilla.values:
+            errors['modo_origen'] = f'Modo inválido. Opciones: {list(ModoOrigenPlantilla.values)}'
+        if errors:
+            raise DRFValidationError(errors)
+
+        archivo = request.FILES.get('archivo_docx')
+        if modo_origen == ModoOrigenPlantilla.ARCHIVO:
+            if not archivo:
+                raise DRFValidationError({'archivo_docx': 'Se requiere un archivo .docx para el modo "archivo".'})
+            try:
+                validar_docx_subido(archivo)
+            except DjangoValidationError as exc:
+                raise DRFValidationError({'archivo_docx': exc.messages})
+
         activa = str(request.data.get('activa', 'true')).lower() in ('1', 'true', 'si')
 
         plantilla = PlantillaDocumento.objects.create(
             nombre=nombre,
             tipo_contrato=tipo_contrato,
             software_id=software_id,
+            modo_origen=modo_origen,
             archivo_docx=archivo,
             version_codigo=version_codigo,
             activa=activa,
@@ -292,3 +314,92 @@ class ClausulaDetailView(APIView):
         clausula.activa = False
         clausula.save()
         return Response({'status': 'deleted'})
+
+
+class EmitidosListView(APIView):
+    """
+    GET /api/plantillas/emitidos/
+    Lista paginada de documentos generados (registros inmutables).
+
+    Query params:
+        - software_id: filtra por software del contrato
+        - cliente_id: filtra por cliente del contrato
+        - contrato_id: filtra por contrato específico
+        - fecha_desde / fecha_hasta: rango de fecha_generacion (YYYY-MM-DD)
+        - page / page_size: paginación (default page_size=20, max=100)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from contratos.models import Contrato
+
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+            page_size = min(100, max(1, int(request.query_params.get('page_size', 20))))
+        except (ValueError, TypeError):
+            page, page_size = 1, 20
+
+        qs = DocumentoGenerado.objects.select_related(
+            'plantilla', 'contrato', 'contrato__cliente',
+            'contrato__software', 'generado_por',
+        ).order_by('-fecha_generacion')
+
+        software_id = request.query_params.get('software_id')
+        if software_id:
+            qs = qs.filter(contrato__software_id=software_id)
+
+        cliente_id = request.query_params.get('cliente_id')
+        if cliente_id:
+            qs = qs.filter(contrato__cliente_id=cliente_id)
+
+        contrato_id = request.query_params.get('contrato_id')
+        if contrato_id:
+            qs = qs.filter(contrato_id=contrato_id)
+
+        fecha_desde = request.query_params.get('fecha_desde')
+        if fecha_desde:
+            qs = qs.filter(fecha_generacion__date__gte=fecha_desde)
+
+        fecha_hasta = request.query_params.get('fecha_hasta')
+        if fecha_hasta:
+            qs = qs.filter(fecha_generacion__date__lte=fecha_hasta)
+
+        total = qs.count()
+        offset = (page - 1) * page_size
+        items = list(qs[offset: offset + page_size])
+
+        def _to_dict(d):
+            cliente = d.contrato.cliente
+            cliente_nombre = (
+                getattr(getattr(cliente, 'personajuridica', None), 'razon_social', None)
+                or getattr(getattr(cliente, 'personanatural', None), 'nombre_completo', None)
+                or str(cliente)
+            )
+            return {
+                'id': d.id,
+                'contrato_id': d.contrato_id,
+                'contrato_display': f'CTR-{str(d.contrato_id).zfill(6)}',
+                'cliente_id': d.contrato.cliente_id,
+                'cliente_nombre': cliente_nombre,
+                'software_id': d.contrato.software_id,
+                'software_nombre': d.contrato.software.nombre if d.contrato.software_id else '',
+                'plantilla_id': d.plantilla_id,
+                'plantilla_nombre': d.plantilla.nombre,
+                'plantilla_version': d.plantilla.version_codigo,
+                'hash_sha256': d.hash_sha256,
+                'fecha_generacion': d.fecha_generacion,
+                'generado_por': (
+                    d.generado_por.get_full_name() or d.generado_por.username
+                ) if d.generado_por_id else 'Sistema',
+                'tiene_pdf': bool(d.archivo_pdf),
+                'pdf_url': request.build_absolute_uri(d.archivo_pdf.url) if d.archivo_pdf else None,
+            }
+
+        return Response({
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': max(1, -(-total // page_size)),
+            'results': [_to_dict(d) for d in items],
+        })
+

@@ -4,15 +4,27 @@ from django.db import models, transaction
 from contratos.models import TipoContrato
 
 
+class ModoOrigenPlantilla(models.TextChoices):
+    ARCHIVO = 'archivo', 'Documento propio (.docx)'
+    CLAUSULAS = 'clausulas', 'Generado por cláusulas del sistema'
+
+
 class PlantillaDocumento(models.Model):
-    """Plantilla .docx (docxtpl) subida por legal, con placeholders Jinja2.
-    `software=None` = plantilla global (fallback si no hay una específica del tenant)."""
+    """Plantilla de contrato vinculada a un Software/Producto del catálogo.
+    modo_origen='archivo'  → se usa el .docx subido directamente.
+    modo_origen='clausulas' → el documento se genera dinámicamente con el motor de cláusulas."""
     id = models.BigAutoField(primary_key=True)
     nombre = models.CharField(max_length=150)
     tipo_contrato = models.CharField(max_length=30, choices=TipoContrato.choices)
-    software = models.ForeignKey('catalogo.Software', on_delete=models.PROTECT, db_column='software_id',
+    software = models.ForeignKey('catalogo.Producto', on_delete=models.PROTECT, db_column='software_id',
                                  null=True, blank=True)
-    archivo_docx = models.FileField(upload_to='plantillas_contrato/%Y/%m/')
+    modo_origen = models.CharField(
+        max_length=20,
+        choices=ModoOrigenPlantilla.choices,
+        default=ModoOrigenPlantilla.ARCHIVO,
+        help_text="Indica si la plantilla usa un archivo .docx propio o el motor de cláusulas."
+    )
+    archivo_docx = models.FileField(upload_to='plantillas_contrato/%Y/%m/', null=True, blank=True)
     version_codigo = models.CharField(max_length=32)
     activa = models.BooleanField(default=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
