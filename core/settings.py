@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -25,7 +26,11 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-$+=zhl#u$2u5no#cvk+15)#%p)$r3k^0yh8d0)5z*$j1^=nanq'
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        'SECRET_KEY no está definido. Agrégalo al archivo .env (nunca lo hardcodees ni lo comitees).'
+    )
 
 # SECURITY WARNING: don't run with debug turned on in production!
 # Default False (seguro) — se activa solo si .env trae DEBUG=True.
@@ -56,6 +61,7 @@ INSTALLED_APPS = [
     'legal',
     'documentos',
     'plantillas',
+    'analytics',
     'axes',
     'django_otp',
     'django_otp.plugins.otp_totp',
@@ -208,6 +214,8 @@ CORS_ALLOWED_ORIGINS = [
     'http://localhost:5175',
     'http://localhost:5176',
     'http://127.0.0.1:5173',
+    'http://144.217.10.38',
+    'https://144.217.10.38',
 ]
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = [
@@ -217,4 +225,7 @@ CSRF_TRUSTED_ORIGINS = [
     'http://localhost:5176',
     'http://127.0.0.1:5173',
     'http://144.217.10.38:5173',
+    'http://144.217.10.38',
+    'https://144.217.10.38',
 ]
+

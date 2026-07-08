@@ -12,7 +12,6 @@ def _software_a_dict(s):
     return {
         'id': s.id,
         'nombre': s.nombre,
-        'slug': s.slug,
     }
 
 
@@ -21,7 +20,7 @@ class SoftwareListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = Software.objects.all().order_by('nombre')
+        qs = Producto.objects.filter(categoria='Software').order_by('nombre')
         return Response([_software_a_dict(s) for s in qs])
 
 

@@ -61,7 +61,7 @@ class TolerantUndefined(StrictUndefined):
         return super().__len__()
 
 from .contexto import construir_contexto
-from ..models import DocumentoGenerado, PlantillaDocumento
+from ..models import DocumentoGenerado, PlantillaDocumento, ModoOrigenPlantilla, Clausula
 
 
 class PlantillaRenderError(Exception):
@@ -80,10 +80,64 @@ class SinPlantillaActivaError(PlantillaRenderError):
     """No hay ninguna PlantillaDocumento activa (ni específica ni global) para el tipo de contrato."""
 
 
-def renderizar_docx(plantilla: PlantillaDocumento, contexto: dict) -> bytes:
+def construir_docx_desde_clausulas(plantilla=None, contrato=None) -> io.BytesIO:
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    doc = Document()
+    
+    style = doc.styles['Normal']
+    style.font.name = 'Calibri'
+    style.font.size = Pt(10)
+
+    title = doc.add_heading('CONTRATO DE SERVICIOS (GENERADO POR CLÁUSULAS)', level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if title.runs:
+        title.runs[0].font.color.rgb = RGBColor(0x1E, 0x40, 0xAF)
+    
+    doc.add_paragraph()
+
+    if contrato and contrato.texto_adicional_clausulas:
+        for p_text in contrato.texto_adicional_clausulas.split('\n'):
+            if p_text.strip():
+                p = doc.add_paragraph(p_text.strip())
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                p.paragraph_format.space_after = Pt(6)
+    else:
+        if plantilla:
+            clausulas = plantilla.clausulas_seleccionadas.filter(activa=True).prefetch_related('versiones')
+        else:
+            clausulas = Clausula.objects.filter(activa=True).prefetch_related('versiones')
+        
+        for i, c in enumerate(clausulas, start=1):
+            version = c.versiones.filter(activa=True, tipo='Estándar').first()
+            if not version:
+                continue
+                
+            h = doc.add_heading(f"{i}. {c.nombre.upper()}", level=1)
+            h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            if h.runs:
+                h.runs[0].font.color.rgb = RGBColor(0x1E, 0x40, 0xAF)
+                
+            p = doc.add_paragraph(version.texto)
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.space_after = Pt(6)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def renderizar_docx(plantilla: PlantillaDocumento, contexto: dict, contrato=None) -> bytes:
     """Renderiza la plantilla .docx con el contexto dado. Devuelve los bytes del docx resultante."""
     try:
-        doc = DocxTemplate(plantilla.archivo_docx.path)
+        if plantilla.modo_origen == ModoOrigenPlantilla.CLAUSULAS:
+            docx_base = construir_docx_desde_clausulas(plantilla, contrato)
+            doc = DocxTemplate(docx_base)
+        else:
+            doc = DocxTemplate(plantilla.archivo_docx.path)
         # TolerantUndefined: permite '____________' pero falla si es otra variable no resuelta.
         jinja_env = Environment(undefined=TolerantUndefined)
         doc.render(contexto, jinja_env=jinja_env)
@@ -157,6 +211,30 @@ def resolver_plantilla_activa(tipo_contrato: str, software_id) -> PlantillaDocum
     )
 
 
+def obtener_preview_pdf(plantilla: PlantillaDocumento) -> Path:
+    """PDF de la plantilla tal cual (variables sin resolver), para previsualizar
+    en el catálogo. Se cachea en disco por hash del .docx: LibreOffice tarda
+    ~1-2 s por conversión y la plantilla no cambia entre requests."""
+    from ..models import ModoOrigenPlantilla
+    
+    if plantilla.modo_origen == ModoOrigenPlantilla.CLAUSULAS:
+        docx_bytes = construir_docx_desde_clausulas(plantilla).read()
+    else:
+        with plantilla.archivo_docx.open('rb') as f:
+            docx_bytes = f.read()
+            
+    digest = hashlib.sha256(docx_bytes).hexdigest()[:16]
+
+    cache_dir = Path(settings.MEDIA_ROOT) / 'plantillas_previews'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = cache_dir / f'plantilla_{plantilla.id}_{digest}.pdf'
+
+    if not pdf_path.exists():
+        pdf_bytes = convertir_a_pdf(docx_bytes)
+        pdf_path.write_bytes(pdf_bytes)
+    return pdf_path
+
+
 def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=None) -> DocumentoGenerado:
     """Orquesta: resuelve plantilla si no viene dada, construye contexto,
     renderiza docx, convierte a PDF, calcula hash y crea el DocumentoGenerado
@@ -165,7 +243,7 @@ def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=No
         plantilla = resolver_plantilla_activa(contrato.tipo_contrato, contrato.software_id)
 
     contexto = construir_contexto(contrato)
-    docx_bytes = renderizar_docx(plantilla, contexto)
+    docx_bytes = renderizar_docx(plantilla, contexto, contrato)
     pdf_bytes = convertir_a_pdf(docx_bytes)
     hash_pdf = hashlib.sha256(pdf_bytes).hexdigest()
 

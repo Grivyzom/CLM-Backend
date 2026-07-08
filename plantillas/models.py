@@ -25,6 +25,7 @@ class PlantillaDocumento(models.Model):
         help_text="Indica si la plantilla usa un archivo .docx propio o el motor de cláusulas."
     )
     archivo_docx = models.FileField(upload_to='plantillas_contrato/%Y/%m/', null=True, blank=True)
+    clausulas_seleccionadas = models.ManyToManyField('Clausula', blank=True, related_name='plantillas')
     version_codigo = models.CharField(max_length=32)
     activa = models.BooleanField(default=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)

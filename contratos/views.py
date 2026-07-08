@@ -1,6 +1,6 @@
 import calendar
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db.models import Q, Sum, Count, Case, When, F, DecimalField
 from django.shortcuts import get_object_or_404
@@ -11,7 +11,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework import status as http_status
 
-from catalogo.models import Software
+from catalogo.models import Producto
 from clientes.models import Cliente
 from plantillas.models import DocumentoGenerado
 from .models import (
@@ -141,7 +141,7 @@ class DashboardView(APIView):
 
     # ── Serie MRR (6 meses, por software; top 5 + "Otros") ───────────────────
     def _build_mrr_series(self, today, max_series=5):
-        softwares = list(Software.objects.order_by('nombre'))
+        softwares = list(Producto.objects.filter(categoria='Software').order_by('nombre'))
         meses = [_shift_months(today, -i) for i in range(5, -1, -1)]
 
         # Matriz cruda: software → [mrr en $k por mes]
@@ -321,6 +321,16 @@ def _compute_mrr_arr(monto, tipo_contrato, frecuencia):
     return mrr, mrr * Decimal('12')
 
 
+def _parse_fecha_iso(valor):
+    """Acepta date o string 'YYYY-MM-DD'; devuelve date o None si es inválido."""
+    if isinstance(valor, date):
+        return valor
+    try:
+        return date.fromisoformat(str(valor))
+    except (TypeError, ValueError):
+        return None
+
+
 def _dias_restantes(fecha_vencimiento, today):
     if not fecha_vencimiento:
         return None
@@ -375,7 +385,7 @@ def _build_responsable_map(contrato_ids):
 
 class ContratoListCreateView(APIView):
     """
-    GET /api/contratos/?search=&etapa=&software=&page=&page_size=
+    GET /api/contratos/?search=&etapa=&software=&cliente=&page=&page_size=
     Lista paginada de contratos con datos reales (para tabla/kanban de Contratos).
 
     POST /api/contratos/
@@ -412,6 +422,10 @@ class ContratoListCreateView(APIView):
         software_id = request.query_params.get('software')
         if software_id:
             qs = qs.filter(software_id=software_id)
+
+        cliente_id = request.query_params.get('cliente')
+        if cliente_id:
+            qs = qs.filter(cliente_id=cliente_id)
 
         ordering = request.query_params.get('ordering', '').strip()
         if ordering:
@@ -483,7 +497,6 @@ class ContratoListCreateView(APIView):
         software_id = data.get('software_id')
         sla_id = data.get('sla_id')
         tipo_contrato = data.get('tipo_contrato')
-        fecha_inicio = data.get('fecha_inicio')
 
         errors = {}
         if not cliente_id:
@@ -494,8 +507,35 @@ class ContratoListCreateView(APIView):
             errors['sla_id'] = 'Este campo es requerido.'
         if tipo_contrato not in TipoContrato.values:
             errors['tipo_contrato'] = 'Tipo de contrato inválido.'
-        if not fecha_inicio:
-            errors['fecha_inicio'] = 'Este campo es requerido.'
+
+        monto = data.get('monto')
+        try:
+            monto = Decimal(str(monto)) if monto not in (None, '') else Decimal('0')
+            if monto < 0:
+                errors['monto'] = 'El monto no puede ser negativo.'
+        except InvalidOperation:
+            errors['monto'] = 'Monto inválido.'
+            monto = Decimal('0')
+
+        fecha_inicio = _parse_fecha_iso(data.get('fecha_inicio'))
+        if fecha_inicio is None:
+            errors['fecha_inicio'] = 'Fecha de inicio requerida (formato YYYY-MM-DD).'
+
+        fecha_vencimiento = None
+        if data.get('fecha_vencimiento'):
+            fecha_vencimiento = _parse_fecha_iso(data.get('fecha_vencimiento'))
+            if fecha_vencimiento is None:
+                errors['fecha_vencimiento'] = 'Fecha inválida (formato YYYY-MM-DD).'
+            elif fecha_inicio and fecha_vencimiento < fecha_inicio:
+                errors['fecha_vencimiento'] = 'Debe ser igual o posterior a la fecha de inicio.'
+
+        try:
+            dias_gracia = int(data.get('dias_gracia_autorizados') or 0)
+            if dias_gracia < 0:
+                errors['dias_gracia_autorizados'] = 'Debe ser un número mayor o igual a 0.'
+        except (TypeError, ValueError):
+            errors['dias_gracia_autorizados'] = 'Debe ser un número entero.'
+            dias_gracia = 0
 
         frecuencia = data.get('frecuencia_facturacion') or None
         if tipo_contrato == TipoContrato.RECURRENTE:
@@ -511,26 +551,26 @@ class ContratoListCreateView(APIView):
 
         if not Cliente.objects.filter(pk=cliente_id).exists():
             raise DRFValidationError({'cliente_id': 'Cliente no encontrado.'})
-        if not Software.objects.filter(pk=software_id).exists():
-            raise DRFValidationError({'software_id': 'Software no encontrado.'})
+        if not Producto.objects.filter(pk=software_id).exists():
+            raise DRFValidationError({'software_id': 'Producto no encontrado.'})
         if not SLA.objects.filter(pk=sla_id).exists():
             raise DRFValidationError({'sla_id': 'SLA no encontrado.'})
 
+        from django.db import transaction, IntegrityError
         try:
-            from django.db import transaction
             with transaction.atomic():
                 contrato = Contrato.objects.create(
                     cliente_id=cliente_id,
                     software_id=software_id,
                     sla_id=sla_id,
                     tipo_contrato=tipo_contrato,
-                    monto=data.get('monto') or 0,
+                    monto=monto,
                     frecuencia_facturacion=frecuencia,
                     fecha_inicio=fecha_inicio,
-                    fecha_vencimiento=data.get('fecha_vencimiento') or None,
-                    dias_gracia_autorizados=data.get('dias_gracia_autorizados') or 0,
+                    fecha_vencimiento=fecha_vencimiento,
+                    dias_gracia_autorizados=dias_gracia,
                 )
-                
+
                 # Seed default obligations
                 ObligacionSLA.objects.create(
                     contrato=contrato,
@@ -544,20 +584,20 @@ class ContratoListCreateView(APIView):
                     descripcion=f"Tiempo de respuesta máximo de {contrato.sla.tiempo_respuesta_horas} horas para incidentes",
                     penalizacion="Compensación según acuerdo comercial"
                 )
-        except Exception as e:
-            raise DRFValidationError({'error': str(e)})
 
-        # Los campos numéricos/fecha llegan como strings del JSON; el atributo en
-        # memoria no se recasta hasta refrescar desde la BD (Decimal, date, etc.).
-        contrato.refresh_from_db()
-
-        HistorialEtapaContrato.objects.create(
-            contrato=contrato,
-            etapa_anterior=None,
-            etapa_nueva=contrato.etapa,
-            usuario=request.user,
-            notas='Creación inicial desde el CLM',
-        )
+                # El registro inicial del historial define al "responsable" del
+                # contrato; debe crearse (o no) junto con el contrato mismo.
+                HistorialEtapaContrato.objects.create(
+                    contrato=contrato,
+                    etapa_anterior=None,
+                    etapa_nueva=contrato.etapa,
+                    usuario=request.user,
+                    notas='Creación inicial desde el CLM',
+                )
+        except IntegrityError:
+            raise DRFValidationError({
+                'error': 'Los datos del contrato violan una restricción de integridad. Revisa montos y fechas.'
+            })
 
         return Response(_contrato_detail_dict(contrato), status=http_status.HTTP_201_CREATED)
 
@@ -644,6 +684,18 @@ def _contrato_detail_dict(c):
 
     responsable_map = _build_responsable_map([c.id])
 
+    try:
+        from plantillas.services.renderizado import resolver_plantilla_activa, SinPlantillaActivaError
+        plantilla_activa_obj = resolver_plantilla_activa(c.tipo_contrato, c.software_id)
+        plantilla_activa_info = {
+            'id': plantilla_activa_obj.id,
+            'nombre': plantilla_activa_obj.nombre,
+            'version_codigo': plantilla_activa_obj.version_codigo,
+            'modo_origen': plantilla_activa_obj.modo_origen,
+        }
+    except Exception:
+        plantilla_activa_info = None
+
     return {
         'id': c.id,
         'nombre': _contrato_nombre(c),
@@ -674,6 +726,8 @@ def _contrato_detail_dict(c):
         'version': c.version,
         'parent_contrato_id': c.parent_contrato_id,
         'versiones': versiones,
+        'plantilla_activa': plantilla_activa_info,
+        'texto_adicional_clausulas': c.texto_adicional_clausulas,
     }
 
 
@@ -704,6 +758,7 @@ class ContratoDetailView(APIView):
         campo_simple = [
             'monto', 'status', 'sla_id', 'fecha_vencimiento',
             'dias_gracia_autorizados', 'frecuencia_facturacion',
+            'texto_adicional_clausulas',
         ]
         dirty = False
         for campo in campo_simple:

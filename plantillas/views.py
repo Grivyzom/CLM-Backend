@@ -1,3 +1,4 @@
+from django.db.models import Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
@@ -12,7 +13,7 @@ from contratos.models import Contrato, EtapaContrato
 from .models import PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula, ModoOrigenPlantilla
 from .services.validacion import validar_docx_subido
 from .services.renderizado import (
-    generar_documento, resolver_plantilla_activa,
+    generar_documento, resolver_plantilla_activa, obtener_preview_pdf,
     PlantillaRenderError, VariablesFaltantesError, SinPlantillaActivaError, ConversionPDFError,
 )
 
@@ -41,6 +42,7 @@ def _plantilla_a_dict(p: PlantillaDocumento):
         'activa': p.activa,
         'fecha_creacion': p.fecha_creacion,
         'usos': usos,
+        'clausulas_seleccionadas': list(p.clausulas_seleccionadas.values_list('id', flat=True)),
     }
 
 
@@ -61,8 +63,11 @@ class PlantillaListCreateView(APIView):
     GET  /api/plantillas/plantillas/?tipo_contrato=&software=&activa=
     POST /api/plantillas/plantillas/  (multipart: nombre, tipo_contrato, version_codigo,
                                         archivo_docx, software opcional, activa opcional)
+
+    Listar es para cualquier usuario autenticado (el modal de Nuevo Contrato
+    necesita las plantillas); registrar/modificar queda reservado a staff.
     """
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
         qs = PlantillaDocumento.objects.select_related('software').all()
@@ -70,10 +75,16 @@ class PlantillaListCreateView(APIView):
         software_id = request.GET.get('software')
         activa = request.GET.get('activa')
         modo_origen = request.GET.get('modo_origen')
+        incluir_globales = request.GET.get('incluir_globales', '').lower() in ('1', 'true', 'si')
         if tipo_contrato:
             qs = qs.filter(tipo_contrato=tipo_contrato)
         if software_id:
-            qs = qs.filter(software_id=software_id)
+            # `incluir_globales` suma las plantillas sin software asignado, que el
+            # motor de renderizado usa como fallback (resolver_plantilla_activa).
+            if incluir_globales:
+                qs = qs.filter(Q(software_id=software_id) | Q(software__isnull=True))
+            else:
+                qs = qs.filter(software_id=software_id)
         if activa is not None:
             qs = qs.filter(activa=activa.lower() in ('1', 'true', 'si'))
         if modo_origen:
@@ -81,6 +92,11 @@ class PlantillaListCreateView(APIView):
         return Response([_plantilla_a_dict(p) for p in qs])
 
     def post(self, request):
+        if not request.user.is_staff:
+            return Response(
+                {'error': 'Solo administradores pueden registrar plantillas.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         nombre = request.data.get('nombre')
         tipo_contrato = request.data.get('tipo_contrato')
         version_codigo = request.data.get('version_codigo')
@@ -122,6 +138,16 @@ class PlantillaListCreateView(APIView):
             activa=activa,
             subida_por=request.user,
         )
+
+        clausulas_str = request.data.get('clausulas_seleccionadas')
+        if clausulas_str:
+            import json
+            try:
+                clausulas_ids = json.loads(clausulas_str)
+                plantilla.clausulas_seleccionadas.set(clausulas_ids)
+            except ValueError:
+                pass
+
         return Response(_plantilla_a_dict(plantilla), status=status.HTTP_201_CREATED)
 
 
@@ -139,11 +165,73 @@ class PlantillaDetailView(APIView):
 
     def patch(self, request, pk):
         plantilla = get_object_or_404(PlantillaDocumento, pk=pk)
-        if 'activa' not in request.data:
-            raise DRFValidationError('Solo se admite actualizar el campo "activa".')
-        plantilla.activa = str(request.data.get('activa')).lower() in ('1', 'true', 'si')
+        
+        if 'activa' in request.data:
+            plantilla.activa = str(request.data.get('activa')).lower() in ('1', 'true', 'si')
+            
+        if 'nombre' in request.data:
+            plantilla.nombre = request.data.get('nombre')
+        if 'tipo_contrato' in request.data:
+            plantilla.tipo_contrato = request.data.get('tipo_contrato')
+        if 'version_codigo' in request.data:
+            plantilla.version_codigo = request.data.get('version_codigo')
+        if 'software' in request.data:
+            software_id = request.data.get('software')
+            plantilla.software_id = software_id if software_id else None
+        if 'modo_origen' in request.data:
+            plantilla.modo_origen = request.data.get('modo_origen')
+            
+        archivo = request.FILES.get('archivo_docx')
+        if archivo:
+            if plantilla.modo_origen == ModoOrigenPlantilla.ARCHIVO:
+                try:
+                    validar_docx_subido(archivo)
+                except DjangoValidationError as exc:
+                    raise DRFValidationError({'archivo_docx': exc.messages})
+                plantilla.archivo_docx = archivo
+
+        clausulas_str = request.data.get('clausulas_seleccionadas')
+        if clausulas_str is not None:
+            import json
+            try:
+                clausulas_ids = json.loads(clausulas_str)
+                plantilla.clausulas_seleccionadas.set(clausulas_ids)
+            except ValueError:
+                pass
+
         plantilla.save()
         return Response(_plantilla_a_dict(plantilla))
+
+
+class PlantillaPreviewPDFView(APIView):
+    """GET /api/plantillas/plantillas/<id>/preview-pdf/
+
+    Sirve un PDF de la plantilla original (con sus variables sin resolver)
+    para previsualizarla embebida en el catálogo. Solo aplica a plantillas
+    modo 'archivo'; las de cláusulas no tienen documento base.
+    """
+
+    def get(self, request, pk):
+        plantilla = get_object_or_404(PlantillaDocumento, pk=pk)
+        if plantilla.modo_origen == ModoOrigenPlantilla.ARCHIVO and not plantilla.archivo_docx:
+            return Response(
+                {'error': 'Esta plantilla en modo archivo no tiene un documento base (.docx) para previsualizar.'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        try:
+            pdf_path = obtener_preview_pdf(plantilla)
+        except ConversionPDFError:
+            return Response(
+                {'error': 'No se pudo generar la previsualización PDF de la plantilla. Intenta nuevamente.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        response = FileResponse(
+            open(pdf_path, 'rb'), as_attachment=False,
+            filename=f"plantilla_{plantilla.id}_preview.pdf", content_type='application/pdf',
+        )
+        # Igual que en DescargarPDFView inline: el middleware pondría DENY.
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+        return response
 
 
 class DocumentoGeneradoListView(APIView):
@@ -206,14 +294,24 @@ class GenerarDocumentoView(APIView):
 
 
 class DescargarPDFView(APIView):
-    """GET /api/plantillas/documentos/<id>/pdf/ — el único archivo pensado para descarga externa."""
+    """GET /api/plantillas/documentos/<id>/pdf/ — el único archivo pensado para descarga externa.
+
+    Con `?inline=1` se sirve sin Content-Disposition: attachment, para
+    previsualizarlo embebido (iframe) en el workspace del contrato.
+    """
 
     def get(self, request, pk):
         documento = get_object_or_404(DocumentoGenerado, pk=pk)
-        return FileResponse(
-            documento.archivo_pdf.open('rb'), as_attachment=True,
+        inline = request.GET.get('inline', '').lower() in ('1', 'true', 'si')
+        response = FileResponse(
+            documento.archivo_pdf.open('rb'), as_attachment=not inline,
             filename=f"contrato_{documento.contrato_id}.pdf", content_type='application/pdf',
         )
+        if inline:
+            # XFrameOptionsMiddleware pone DENY por defecto y rompería el iframe;
+            # SAMEORIGIN limita el embebido al propio CLM.
+            response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+        return response
 
 
 class DescargarDocxView(APIView):
@@ -293,17 +391,42 @@ class ClausulaDetailView(APIView):
                 clausula.riesgo = data.get('risk', clausula.riesgo)
                 clausula.save()
 
-                # Reemplazar versiones: desactivar anteriores y crear nuevas
-                clausula.versiones.filter(activa=True).update(activa=False)
+                active_versions = {v.id: v for v in clausula.versiones.filter(activa=True)}
+                processed_ids = set()
                 
                 versions_data = data.get('versions', [])
                 for v_data in versions_data:
-                    VersionClausula.objects.create(
-                        clausula=clausula,
-                        etiqueta=v_data.get('label', 'Estándar'),
-                        tipo=v_data.get('tag', 'Estándar'),
-                        texto=v_data.get('text', '')
-                    )
+                    v_id = v_data.get('id')
+                    label = v_data.get('label', 'Estándar')
+                    tag = v_data.get('tag', 'Estándar')
+                    text = v_data.get('text', '')
+                    
+                    if v_id and v_id in active_versions:
+                        existing = active_versions[v_id]
+                        processed_ids.add(v_id)
+                        
+                        if existing.etiqueta != label or existing.tipo != tag or existing.texto != text:
+                            existing.activa = False
+                            existing.save()
+                            VersionClausula.objects.create(
+                                clausula=clausula,
+                                etiqueta=label,
+                                tipo=tag,
+                                texto=text
+                            )
+                    else:
+                        VersionClausula.objects.create(
+                            clausula=clausula,
+                            etiqueta=label,
+                            tipo=tag,
+                            texto=text
+                        )
+                
+                for v_id, v in active_versions.items():
+                    if v_id not in processed_ids:
+                        v.activa = False
+                        v.save()
+
             return Response({'status': 'ok'})
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)

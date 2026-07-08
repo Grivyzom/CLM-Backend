@@ -25,6 +25,22 @@ services:
       - "6432:5432"
     depends_on:
       - db
+  metabase:
+    image: metabase/metabase:latest
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: ${DB_NAME:-tu_base_de_datos}
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${DB_USER:-tu_usuario}
+      MB_DB_PASS: ${DB_PASSWORD:-tu_password}
+      MB_DB_HOST: db
+    depends_on:
+      - db
+    volumes:
+      - metabase_data:/metabase.db
 
 volumes:
   postgres_data:
+  metabase_data:

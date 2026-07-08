@@ -61,7 +61,7 @@ class EtapaContrato(models.TextChoices):
 class Contrato(models.Model):
     id = models.BigAutoField(primary_key=True)
     cliente = models.ForeignKey('clientes.Cliente', on_delete=models.PROTECT, db_column='cliente_id')
-    software = models.ForeignKey('catalogo.Software', on_delete=models.PROTECT, db_column='software_id')
+    software = models.ForeignKey('catalogo.Producto', on_delete=models.PROTECT, db_column='software_id')
     sla = models.ForeignKey(SLA, on_delete=models.PROTECT, db_column='sla_id')
     
     etapa = models.CharField(max_length=30, choices=EtapaContrato.choices, default=EtapaContrato.BORRADOR)
@@ -78,6 +78,8 @@ class Contrato(models.Model):
 
     version = models.CharField(max_length=10, default="1.0")
     parent_contrato = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='versiones_hijas', db_column='parent_contrato_id')
+    
+    texto_adicional_clausulas = models.TextField(blank=True, null=True, help_text="Texto editable para contratos generados por cláusulas")
 
     objects = models.Manager()
     scoped_objects = SoftwareScopedManager()

@@ -1,4 +1,4 @@
-from django.db.models import Count, Q, Subquery, OuterRef, IntegerField
+from django.db.models import Count, Q, Subquery, OuterRef, IntegerField, ProtectedError
 from django.db.models.functions import Coalesce
 from django.db import IntegrityError
 from rest_framework.views import APIView
@@ -469,6 +469,10 @@ class ClienteDetailView(APIView):
         return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
 
     def delete(self, request, pk):
+        from legal.models import LogAceptacion
+        if Contrato.objects.filter(cliente_id=pk).exists() or LogAceptacion.objects.filter(cliente_id=pk).exists():
+            return Response({'error': 'No se puede eliminar el cliente porque tiene contratos u otros registros asociados.'}, status=status.HTTP_400_BAD_REQUEST)
+
         # Buscar en PersonaJuridica
         try:
             obj = PersonaJuridica.objects.get(pk=pk)
@@ -476,6 +480,8 @@ class ClienteDetailView(APIView):
             return Response(status=status.HTTP_204_NO_CONTENT)
         except PersonaJuridica.DoesNotExist:
             pass
+        except ProtectedError:
+            return Response({'error': 'No se puede eliminar el cliente porque tiene contratos u otros registros asociados.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Buscar en PersonaNatural
         try:
@@ -484,6 +490,8 @@ class ClienteDetailView(APIView):
             return Response(status=status.HTTP_204_NO_CONTENT)
         except PersonaNatural.DoesNotExist:
             pass
+        except ProtectedError:
+            return Response({'error': 'No se puede eliminar el cliente porque tiene contratos u otros registros asociados.'}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
 

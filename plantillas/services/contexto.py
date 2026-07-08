@@ -87,7 +87,8 @@ def construir_contexto(contrato):
         'cliente': _contexto_cliente(contrato.cliente),
         'software': {
             'nombre': software.nombre,
-            'slug': software.slug,
+            'sku': software.sku,
+            'slug': getattr(software, 'slug', software.sku),
             'descripcion': software.descripcion or '',
         },
         'sla': {

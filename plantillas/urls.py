@@ -4,6 +4,7 @@ from . import views
 urlpatterns = [
     path("plantillas/", views.PlantillaListCreateView.as_view(), name="plantillas_list_create"),
     path("plantillas/<int:pk>/", views.PlantillaDetailView.as_view(), name="plantillas_detail"),
+    path("plantillas/<int:pk>/preview-pdf/", views.PlantillaPreviewPDFView.as_view(), name="plantillas_preview_pdf"),
 
     path("documentos/", views.DocumentoGeneradoListView.as_view(), name="documentos_generados_list"),
     path("documentos/generar/", views.GenerarDocumentoView.as_view(), name="documentos_generar"),

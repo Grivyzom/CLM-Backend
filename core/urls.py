@@ -25,11 +25,14 @@ urlpatterns = [
     path('login/', views.login_page, name='login_page'),
     path('api/auth/login/', views.api_login, name='api_login'),
     path('api/auth/logout/', views.api_logout, name='api_logout'),
+    path('api/auth/me/', views.api_me, name='api_me'),
     path('api/config/currency/', views.api_currency_config, name='api_currency_config'),
     path('api/clientes/', include('clientes.urls')),
     path('api/catalogo/', include('catalogo.urls')),
     path('api/documentos/', include('documentos.urls')),
     path('api/plantillas/', include('plantillas.urls')),
+    path('api/analytics/', include('analytics.urls')),
+    path('api/legal/', include('legal.urls')),
     path('api/', include('contratos.urls')),
 ]
 

@@ -71,17 +71,34 @@ def api_logout(request):
     logout(request)
     return JsonResponse({'success': 'Sesión cerrada exitosamente'})
 
+
+@require_http_methods(["GET"])
+def api_me(request):
+    """Devuelve el usuario de la sesión Django activa, o 401 si no hay sesión."""
+    if not request.user.is_authenticated:
+        return JsonResponse({'error': 'No autenticado'}, status=401)
+
+    return JsonResponse({
+        'username': request.user.username,
+        'is_staff': request.user.is_staff,
+    })
+
 def login_page(request):
     return render(request, 'login.html')
 
 
 @require_http_methods(["GET", "POST"])
-@csrf_exempt
 def api_currency_config(request):
     """
-    GET: Obtener configuración de moneda actual
-    POST: Actualizar configuración de moneda
+    GET: Obtener configuración de moneda actual (requiere sesión activa)
+    POST: Actualizar configuración de moneda (requiere staff)
     """
+    if not request.user.is_authenticated:
+        return JsonResponse({'error': 'Autenticación requerida'}, status=401)
+
+    if request.method == "POST" and not request.user.is_staff:
+        return JsonResponse({'error': 'Requiere permisos de administrador'}, status=403)
+
     try:
         if request.method == "GET":
             # Obtener configuración actual

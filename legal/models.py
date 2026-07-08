@@ -20,7 +20,7 @@ class DocumentoLegal(models.Model):
 class LogAceptacion(models.Model):
     id = models.BigAutoField(primary_key=True)
     cliente = models.ForeignKey('clientes.Cliente', on_delete=models.PROTECT, db_column='cliente_id')
-    software = models.ForeignKey('catalogo.Software', on_delete=models.PROTECT, db_column='software_id')
+    software = models.ForeignKey('catalogo.Producto', on_delete=models.PROTECT, db_column='software_id')
     documento_legal = models.ForeignKey(DocumentoLegal, on_delete=models.PROTECT, db_column='documento_legal_id')
     
     ip_direccion = models.GenericIPAddressField()
