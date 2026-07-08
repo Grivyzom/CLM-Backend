@@ -10,7 +10,7 @@ from rest_framework.permissions import IsAuthenticated
 from clientes.models import Cliente
 from contratos.models import (
     Contrato, EstadoContrato, TipoContrato, FrecuenciaFacturacion,
-    EtapaContrato, HistorialEtapaContrato,
+    EtapaContrato, HistorialEtapaContrato, RegistroPerdonazo,
 )
 
 MESES_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
@@ -60,6 +60,7 @@ class AnalyticsView(APIView):
         return Response({
             'kpis': self._build_kpis(today),
             'salud_cartera': self._build_salud_cartera(today),
+            'reincidencia_perdonazos': self._build_reincidencia_perdonazos(today),
             'flujo_contratos': self._build_flujo(today),
             'vencimientos': self._build_vencimientos(today),
             'por_software': self._build_por_software(),
@@ -150,6 +151,45 @@ class AnalyticsView(APIView):
             'pct_riesgo': pct_riesgo,
             'monto_riesgo': monto_riesgo,
             'contratos_riesgo': contratos_riesgo[:10],
+        }
+
+    # ── Reincidencia de perdonazos: señal temprana de riesgo de churn ────────
+    def _build_reincidencia_perdonazos(self, today, meses=12):
+        ventana_inicio = _shift_months(today, -meses)
+
+        rows = list(
+            RegistroPerdonazo.objects.filter(fecha_concesion__date__gte=ventana_inicio)
+            .values('contrato__cliente_id')
+            .annotate(
+                count=Count('id'),
+                dias_totales=Sum('dias_extendidos'),
+                contratos=Count('contrato_id', distinct=True),
+            )
+            .order_by('-count', '-dias_totales')
+        )
+
+        nombres = {
+            c.pk: str(c)
+            for c in Cliente.objects.filter(pk__in=[r['contrato__cliente_id'] for r in rows])
+        }
+
+        top_reincidentes = [
+            {
+                'cliente_id': r['contrato__cliente_id'],
+                'cliente': nombres.get(r['contrato__cliente_id'], f"Cliente #{r['contrato__cliente_id']}"),
+                'count': r['count'],
+                'dias_totales': r['dias_totales'] or 0,
+                'contratos': r['contratos'],
+                'reincidente': r['count'] >= 2,
+            }
+            for r in rows[:10]
+        ]
+
+        return {
+            'ventana_meses': meses,
+            'total_perdonazos': sum(r['count'] for r in rows),
+            'clientes_afectados': len(rows),
+            'top_reincidentes': top_reincidentes,
         }
 
     # ── Flujo: contratos iniciados vs terminados por mes (últimos 12) ────────
