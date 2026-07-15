@@ -14,7 +14,9 @@ class SoftwareScopedManager(models.Manager):
 
 class SLA(models.Model):
     id = models.BigAutoField(primary_key=True)
-    nombre = models.CharField(max_length=100, unique=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='slas')
+    nombre = models.CharField(max_length=100)
     uptime_garantizado = models.DecimalField(max_digits=5, decimal_places=2)
     tiempo_respuesta_horas = models.IntegerField()
     detalles = models.TextField(blank=True, null=True)
@@ -25,7 +27,9 @@ class SLA(models.Model):
             CheckConstraint(
                 check=Q(uptime_garantizado__lte=100.00),
                 name='chk_uptime_maximo'
-            )
+            ),
+            models.UniqueConstraint(fields=['tenant', 'nombre'],
+                                    name='uniq_sla_nombre_por_tenant'),
         ]
 
     def __str__(self):
@@ -60,6 +64,8 @@ class EtapaContrato(models.TextChoices):
 
 class Contrato(models.Model):
     id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='contratos')
     cliente = models.ForeignKey('clientes.Cliente', on_delete=models.PROTECT, db_column='cliente_id')
     software = models.ForeignKey('catalogo.Producto', on_delete=models.PROTECT, db_column='software_id')
     sla = models.ForeignKey(SLA, on_delete=models.PROTECT, db_column='sla_id')
@@ -89,6 +95,7 @@ class Contrato(models.Model):
         indexes = [
             models.Index(fields=['cliente', 'status'], name='idx_contrato_cliente_status'),
             models.Index(fields=['software', 'status'], name='idx_contrato_soft_status'),
+            models.Index(fields=['tenant', 'status'], name='idx_contrato_tenant_status'),
         ]
         constraints = [
             CheckConstraint(

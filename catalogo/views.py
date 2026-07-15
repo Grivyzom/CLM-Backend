@@ -1,11 +1,12 @@
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.db import IntegrityError
 
 from .models import Producto, Software
+from tenants.permissions import DeleteRequiresTenantAdmin, IsTenantMember, RequiresFeature
+from tenants.scoping import resolve_tenant_for_write, scoped
 
 
 def _software_a_dict(s):
@@ -17,10 +18,10 @@ def _software_a_dict(s):
 
 class SoftwareListView(APIView):
     """GET /api/catalogo/software/ — catálogo de productos de software (para selects)."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('catalogo')]
 
     def get(self, request):
-        qs = Producto.objects.filter(categoria='Software').order_by('nombre')
+        qs = scoped(Producto.objects.all(), request).filter(categoria='Software').order_by('nombre')
         return Response([_software_a_dict(s) for s in qs])
 
 
@@ -45,10 +46,10 @@ class ProductoListCreateView(APIView):
     GET  /api/catalogo/productos/?search=&categoria=
     POST /api/catalogo/productos/  { name, desc, cat, price, currency, unit, status, tipo_licencia, datos_adicionales }
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('catalogo')]
 
     def get(self, request):
-        qs = Producto.objects.all()
+        qs = scoped(Producto.objects.all(), request)
         search = request.GET.get('search')
         categoria = request.GET.get('categoria')
         if search:
@@ -67,16 +68,19 @@ class ProductoListCreateView(APIView):
         if not nombre:
             raise DRFValidationError({'name': 'Este campo es requerido.'})
 
-        # Auto-generate a unique SKU: CAT-YYYYMMDD-XXX
+        tenant = resolve_tenant_for_write(request, data)
+
+        # Auto-generate a unique SKU: CAT-YYYYMMDD-XXX (único dentro del tenant)
         date_str = datetime.date.today().strftime('%Y%m%d')
         while True:
             suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=3))
             sku = f"CAT-{date_str}-{suffix}"
-            if not Producto.objects.filter(sku=sku).exists():
+            if not Producto.objects.filter(tenant=tenant, sku=sku).exists():
                 break
 
         try:
             producto = Producto.objects.create(
+                tenant=tenant,
                 sku=sku,
                 nombre=nombre,
                 descripcion=data.get('desc', ''),
@@ -98,10 +102,10 @@ class ProductoDetailView(APIView):
     PATCH  /api/catalogo/productos/<pk>/
     DELETE /api/catalogo/productos/<pk>/
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('catalogo'), DeleteRequiresTenantAdmin]
 
     def patch(self, request, pk):
-        producto = get_object_or_404(Producto, pk=pk)
+        producto = get_object_or_404(scoped(Producto.objects.all(), request), pk=pk)
         data = request.data
         for campo_api, campo_modelo in [
             ('sku', 'sku'), ('name', 'nombre'), ('desc', 'descripcion'),
@@ -115,6 +119,6 @@ class ProductoDetailView(APIView):
         return Response(_producto_a_dict(producto))
 
     def delete(self, request, pk):
-        producto = get_object_or_404(Producto, pk=pk)
+        producto = get_object_or_404(scoped(Producto.objects.all(), request), pk=pk)
         producto.delete()
         return Response(status=204)

@@ -5,7 +5,9 @@ from django.db.models import Q, Sum, Count, Case, When, F, DecimalField
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+
+from tenants.permissions import IsTenantMember, RequiresFeature
+from tenants.scoping import scoped
 
 from clientes.models import Cliente
 from contratos.models import (
@@ -53,7 +55,10 @@ class AnalyticsView(APIView):
     calendario de vencimientos, concentración por software/cliente y mezcla
     por tipo y SLA. Todo se deriva de datos reales; sin datos cae a cero.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('analytics')]
+
+    def _contratos(self):
+        return scoped(Contrato.objects.all(), self.request)
 
     def get(self, request):
         today = timezone.localdate()
@@ -71,14 +76,14 @@ class AnalyticsView(APIView):
 
     # ── KPIs ─────────────────────────────────────────────────────────────────
     def _build_kpis(self, today):
-        activos = Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+        activos = self._contratos().filter(status=EstadoContrato.ACTIVO)
 
         agg = activos.aggregate(total=Sum('monto'), n=Count('id'))
         valor_cartera = agg['total'] or Decimal('0')
         n_activos = agg['n'] or 0
         ticket_promedio = (valor_cartera / n_activos) if n_activos else Decimal('0')
 
-        mrr = Contrato.objects.filter(
+        mrr = self._contratos().filter(
             tipo_contrato=TipoContrato.RECURRENTE,
             fecha_inicio__lte=today,
         ).filter(
@@ -88,7 +93,7 @@ class AnalyticsView(APIView):
         # Duración contratada media, solo contratos con vencimiento definido.
         duraciones = [
             (c['fecha_vencimiento'] - c['fecha_inicio']).days
-            for c in Contrato.objects.filter(fecha_vencimiento__isnull=False)
+            for c in self._contratos().filter(fecha_vencimiento__isnull=False)
             .values('fecha_inicio', 'fecha_vencimiento')
             if c['fecha_vencimiento'] >= c['fecha_inicio']
         ]
@@ -114,7 +119,7 @@ class AnalyticsView(APIView):
         labels = dict(EstadoContrato.choices)
 
         rows = (
-            Contrato.objects.filter(status__in=ESTADOS)
+            self._contratos().filter(status__in=ESTADOS)
             .values('status').annotate(count=Count('id'), monto=Sum('monto'))
         )
         by_status = {r['status']: r for r in rows}
@@ -133,7 +138,7 @@ class AnalyticsView(APIView):
         pct_riesgo = round(monto_riesgo / monto_total * 100, 1) if monto_total else 0.0
 
         contratos_riesgo = []
-        for c in Contrato.objects.filter(status__in=ESTADOS_RIESGO).select_related('cliente', 'software'):
+        for c in self._contratos().filter(status__in=ESTADOS_RIESGO).select_related('cliente', 'software'):
             dias_vencido = (today - c.fecha_vencimiento).days if c.fecha_vencimiento and today > c.fecha_vencimiento else 0
             contratos_riesgo.append({
                 'id': c.id,
@@ -158,7 +163,7 @@ class AnalyticsView(APIView):
         ventana_inicio = _shift_months(today, -meses)
 
         rows = list(
-            RegistroPerdonazo.objects.filter(fecha_concesion__date__gte=ventana_inicio)
+            scoped(RegistroPerdonazo.objects.all(), self.request, 'contrato__tenant').filter(fecha_concesion__date__gte=ventana_inicio)
             .values('contrato__cliente_id')
             .annotate(
                 count=Count('id'),
@@ -198,10 +203,10 @@ class AnalyticsView(APIView):
         for i in range(11, -1, -1):
             anchor = _shift_months(today, -i)
             m_start, m_end = _month_bounds(anchor)
-            iniciados = Contrato.objects.filter(
+            iniciados = self._contratos().filter(
                 fecha_inicio__gte=m_start, fecha_inicio__lte=m_end
             ).count()
-            terminados = HistorialEtapaContrato.objects.filter(
+            terminados = scoped(HistorialEtapaContrato.objects.all(), self.request, 'contrato__tenant').filter(
                 etapa_nueva=EtapaContrato.TERMINADO,
                 fecha_cambio__date__gte=m_start,
                 fecha_cambio__date__lte=m_end,
@@ -221,7 +226,7 @@ class AnalyticsView(APIView):
             m_start, m_end = _month_bounds(anchor)
             if i == 0:
                 m_start = today  # el mes en curso cuenta desde hoy
-            agg = Contrato.objects.filter(
+            agg = self._contratos().filter(
                 status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA],
                 fecha_vencimiento__gte=m_start,
                 fecha_vencimiento__lte=m_end,
@@ -236,7 +241,7 @@ class AnalyticsView(APIView):
     # ── Concentración de cartera ─────────────────────────────────────────────
     def _build_por_software(self, limit=8):
         rows = (
-            Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+            self._contratos().filter(status=EstadoContrato.ACTIVO)
             .values(nombre_sw=F('software__nombre'))
             .annotate(monto=Sum('monto'), count=Count('id'))
             .order_by('-monto')[:limit]
@@ -248,7 +253,7 @@ class AnalyticsView(APIView):
 
     def _build_top_clientes(self, limit=8):
         rows = list(
-            Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+            self._contratos().filter(status=EstadoContrato.ACTIVO)
             .values('cliente_id')
             .annotate(monto=Sum('monto'), count=Count('id'))
             .order_by('-monto')[:limit]
@@ -271,7 +276,7 @@ class AnalyticsView(APIView):
     def _build_por_tipo(self):
         labels = dict(TipoContrato.choices)
         rows = (
-            Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+            self._contratos().filter(status=EstadoContrato.ACTIVO)
             .values('tipo_contrato')
             .annotate(count=Count('id'), monto=Sum('monto'))
             .order_by('-monto')
@@ -288,7 +293,7 @@ class AnalyticsView(APIView):
 
     def _build_por_sla(self):
         rows = (
-            Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+            self._contratos().filter(status=EstadoContrato.ACTIVO)
             .values(nombre_sla=F('sla__nombre'))
             .annotate(count=Count('id'), monto=Sum('monto'))
             .order_by('-count')

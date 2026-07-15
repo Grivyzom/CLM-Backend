@@ -3,15 +3,21 @@ import uuid
 
 class Software(models.Model):
     id = models.BigAutoField(primary_key=True)
-    nombre = models.CharField(max_length=150, unique=True)
-    slug = models.SlugField(max_length=150, unique=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='softwares')
+    nombre = models.CharField(max_length=150)
+    slug = models.SlugField(max_length=150)
     descripcion = models.TextField(blank=True, null=True)
-    # api_key UUID indexed and unique
+    # api_key UUID indexed and unique (global: identifica al software ante la API externa)
     api_key = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'catalogo_software'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'nombre'], name='uniq_software_nombre_por_tenant'),
+            models.UniqueConstraint(fields=['tenant', 'slug'], name='uniq_software_slug_por_tenant'),
+        ]
 
     def __str__(self):
         return self.nombre
@@ -44,7 +50,9 @@ class Producto(models.Model):
     ]
 
     id = models.BigAutoField(primary_key=True)
-    sku = models.CharField(max_length=40, unique=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='productos')
+    sku = models.CharField(max_length=40)
     nombre = models.CharField(max_length=150)
     descripcion = models.TextField(blank=True, null=True)
     categoria = models.CharField(max_length=20, choices=CATEGORIAS, default='Software')
@@ -59,6 +67,9 @@ class Producto(models.Model):
     class Meta:
         db_table = 'catalogo_producto'
         ordering = ['nombre']
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'sku'], name='uniq_producto_sku_por_tenant'),
+        ]
 
     def __str__(self):
         return f"{self.sku} - {self.nombre}"

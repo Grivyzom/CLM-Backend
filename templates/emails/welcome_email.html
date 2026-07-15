@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bienvenida a KYO-CLM</title>
+    <!-- Import fonts if supported by client -->
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!--[if mso]>
+    <style type="text/css">
+      body, table, td, p, div, span {font-family: Arial, sans-serif !important;}
+    </style>
+    <![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:#0e0c09;font-family:'Space Grotesk', Arial, sans-serif;">
+  <center style="width: 100%; background-color: #0e0c09;">
+    <!-- Main Wrapper -->
+    <table align="center" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#0e0c09; padding:48px 0;">
+      <tr>
+        <td align="center" style="padding-top:48px; padding-bottom:48px;">
+          
+          <!-- Card Container -->
+          <table align="center" width="460" cellpadding="0" cellspacing="0" border="0" style="background-color:#17140f; border-radius:10px; width:460px; max-width:460px; text-align:left; border:1px solid #1e1b15;">
+            
+            <!-- Top accent bar -->
+            <tr>
+              <td height="2" style="background-color:#4c7df5; font-size:2px; line-height:2px;">&nbsp;</td>
+            </tr>
+
+            <!-- Header -->
+            <tr>
+              <td style="padding:20px 28px; border-bottom:1px solid #231f18;">
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <!-- Logo G -->
+                    <td width="28" style="width:28px;">
+                      <table width="28" cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td align="center" height="28" style="background-color:#221f18; border:1px solid #302d25; border-radius:7px; font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:700; color:#f2ede2;">G</td>
+                        </tr>
+                      </table>
+                    </td>
+                    <!-- Texts -->
+                    <td style="padding-left:11px;">
+                      <div style="font-family:'Space Grotesk', sans-serif; font-size:13.5px; font-weight:700; color:#f2ede2; line-height:1.1; letter-spacing:0.01em;">Grivyzom</div>
+                      <div style="font-family:'JetBrains Mono', monospace; font-size:8.5px; font-weight:500; color:#7d7869; text-transform:uppercase; margin-top:3px; letter-spacing:0.16em;">S.P.A</div>
+                    </td>
+                    <!-- Badge -->
+                    <td align="right" valign="middle">
+                      <table cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td style="font-family:'JetBrains Mono', monospace; font-size:9px; font-weight:600; color:#948d7b; text-transform:uppercase; padding:6px 10px; border:1px solid #302d25; border-radius:6px; background-color:#1a1712; letter-spacing:0.14em;">KYO‑CLM</td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Main Banner (gradient CSS puro, sin imagen externa: evita placeholder roto en clientes que bloquean imágenes) -->
+            <tr>
+              <td bgcolor="#17140f" style="padding:26px 28px 0; background-color:#17140f; background-image:radial-gradient(420px 180px at 18% -20%, rgba(76,125,245,0.16), transparent 70%);">
+
+                <!-- Tagline -->
+                <table cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td width="14" height="1" style="background-color:#4c7df5; font-size:1px; line-height:1px;">&nbsp;</td>
+                    <td style="padding-left:8px; font-family:'JetBrains Mono', monospace; font-size:9.5px; font-weight:600; color:#948d7b; text-transform:uppercase; letter-spacing:0.18em;">Bienvenida de cliente</td>
+                  </tr>
+                </table>
+
+                <h1 style="margin:12px 0 0; font-family:'Space Grotesk', sans-serif; font-size:27px; font-weight:700; color:#f5f1e6; letter-spacing:-0.015em; line-height:1.15;">Hola, {{ nombre_cliente }}</h1>
+
+                <!-- Level badge -->
+                <table cellpadding="0" cellspacing="0" border="0" style="margin-top:12px;">
+                  <tr>
+                    <td style="background-color:#1c2539; border:1px solid #2a3c63; border-radius:6px; padding:4px 10px;">
+                      <table cellpadding="0" cellspacing="0" border="0">
+                        <tr>
+                          <td width="6">
+                            <div style="width:6px; height:6px; background-color:#4c7df5; border-radius:50%; line-height:6px; font-size:6px;">&nbsp;</div>
+                          </td>
+                          <td style="padding-left:7px; font-family:'JetBrains Mono', monospace; font-size:10px; font-weight:600; color:#8faefc; text-transform:uppercase; letter-spacing:0.08em;">Nivel Standard</td>
+                        </tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+
+                <p style="margin:16px 0 0; font-family:'Space Grotesk', sans-serif; font-size:13px; font-weight:400; color:#a8a191; line-height:1.6; max-width:360px;">Nos alegra mucho darte la bienvenida a nuestra plataforma. Tu cuenta ha sido registrada con éxito por nuestro equipo administrativo.</p>
+              </td>
+            </tr>
+
+            <!-- Grid stats -->
+            <tr>
+              <td style="padding:20px 28px 0;">
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td width="48%" valign="top">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#1d1a13; border:1px solid #28251e; border-radius:9px;">
+                        <tr><td style="padding:12px 14px;">
+                          <div style="font-family:'JetBrains Mono', monospace; font-size:8.5px; font-weight:600; color:#7d7869; text-transform:uppercase; letter-spacing:0.12em;">ID Cliente</div>
+                          <div style="margin-top:7px; font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:600; color:#f2ede2;">#{{ cliente_id }}</div>
+                        </td></tr>
+                      </table>
+                    </td>
+                    <td width="4%">&nbsp;</td>
+                    <td width="48%" valign="top">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#1d1a13; border:1px solid #28251e; border-radius:9px;">
+                        <tr><td style="padding:12px 14px;">
+                          <div style="font-family:'JetBrains Mono', monospace; font-size:8.5px; font-weight:600; color:#7d7869; text-transform:uppercase; letter-spacing:0.12em;">Nivel</div>
+                          <div style="margin-top:7px; font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:600; color:#8faefc;">Standard</div>
+                        </td></tr>
+                      </table>
+                    </td>
+                  </tr>
+                  <tr><td colspan="3" height="9" style="font-size:9px; line-height:9px;">&nbsp;</td></tr>
+                  <tr>
+                    <td width="48%" valign="top">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#1d1a13; border:1px solid #28251e; border-radius:9px;">
+                        <tr><td style="padding:12px 14px;">
+                          <div style="font-family:'JetBrains Mono', monospace; font-size:8.5px; font-weight:600; color:#7d7869; text-transform:uppercase; letter-spacing:0.12em;">Registro</div>
+                          <div style="margin-top:7px; font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:600; color:#f2ede2;">{{ fecha_registro }}</div>
+                        </td></tr>
+                      </table>
+                    </td>
+                    <td width="4%">&nbsp;</td>
+                    <td width="48%" valign="top">
+                      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#1d1a13; border:1px solid #28251e; border-radius:9px;">
+                        <tr><td style="padding:12px 14px;">
+                          <div style="font-family:'JetBrains Mono', monospace; font-size:8.5px; font-weight:600; color:#7d7869; text-transform:uppercase; letter-spacing:0.12em;">Registrado por</div>
+                          <div style="margin-top:7px; font-family:'JetBrains Mono', monospace; font-size:12px; font-weight:600; color:#f2ede2;">Admin</div>
+                        </td></tr>
+                      </table>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Call to Action -->
+            <tr>
+              <td style="padding:20px 28px 0;">
+                <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td align="center" bgcolor="#4c7df5" style="border-radius:8px;">
+                      <a href="https://clm.grivyzom.com/registro?email={{ email_principal }}" style="display:block; padding:13px; font-family:'Space Grotesk', sans-serif; font-size:13px; font-weight:700; color:#0b1120; letter-spacing:0.01em; text-decoration:none;">Activar mi cuenta</a>
+                    </td>
+                  </tr>
+                </table>
+                <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:15px;">
+                  <tr>
+                    <td style="font-family:'JetBrains Mono', monospace; font-size:10px; font-weight:400; color:#6d6759;">Crea tu usuario y contraseña</td>
+                    <td align="right">
+                      <a href="https://clm.grivyzom.com/login" style="font-family:'JetBrains Mono', monospace; font-size:10.5px; font-weight:600; color:#4c7df5; text-decoration:none;">Iniciar sesión &rarr;</a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Footer -->
+            <tr>
+              <td style="padding:35px 28px 18px;">
+                <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid #231f18;">
+                  <tr><td height="14" style="font-size:14px; line-height:14px;">&nbsp;</td></tr>
+                  <tr>
+                    <td style="font-family:'Space Grotesk', sans-serif; font-size:9.5px; font-weight:400; color:#7d7869;">
+                      <a href="mailto:soporte@grivyzom.com" style="color:#a8a191; font-weight:600; text-decoration:none;">soporte@grivyzom.com</a> &middot; +56 2 2345 6789
+                    </td>
+                    <td align="right" style="font-family:'JetBrains Mono', monospace; font-size:9px; font-weight:400; color:#4a463b;">
+                      &copy; 2026 KYO‑CLM
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+          </table>
+          <!-- End Card -->
+
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+</html>

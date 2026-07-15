@@ -22,17 +22,24 @@ from core import views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('login/', views.login_page, name='login_page'),
     path('api/auth/login/', views.api_login, name='api_login'),
     path('api/auth/logout/', views.api_logout, name='api_logout'),
     path('api/auth/me/', views.api_me, name='api_me'),
+    path('api/auth/register-cliente/', views.api_register_cliente, name='api_register_cliente'),
+    path('api/auth/register-cliente/confirm/', views.api_register_cliente_confirm, name='api_register_cliente_confirm'),
+    path('api/auth/password-reset/', views.api_password_reset, name='api_password_reset'),
+    path('api/auth/password-reset/confirm/', views.api_password_reset_confirm, name='api_password_reset_confirm'),
     path('api/config/currency/', views.api_currency_config, name='api_currency_config'),
+    path('api/tenants/', include('tenants.urls')),
     path('api/clientes/', include('clientes.urls')),
     path('api/catalogo/', include('catalogo.urls')),
     path('api/documentos/', include('documentos.urls')),
     path('api/plantillas/', include('plantillas.urls')),
+    path('api/requerimientos/', include('requerimientos.urls')),
     path('api/analytics/', include('analytics.urls')),
     path('api/legal/', include('legal.urls')),
+    path('api/incidencias/', include('incidencias.urls')),
+    path('api/notificaciones/', include('notificaciones.urls')),
     path('api/', include('contratos.urls')),
 ]
 

@@ -7,6 +7,7 @@ from contratos.models import TipoContrato
 class ModoOrigenPlantilla(models.TextChoices):
     ARCHIVO = 'archivo', 'Documento propio (.docx)'
     CLAUSULAS = 'clausulas', 'Generado por cláusulas del sistema'
+    HTML = 'html', 'Código HTML'
 
 
 class PlantillaDocumento(models.Model):
@@ -14,6 +15,8 @@ class PlantillaDocumento(models.Model):
     modo_origen='archivo'  → se usa el .docx subido directamente.
     modo_origen='clausulas' → el documento se genera dinámicamente con el motor de cláusulas."""
     id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='plantillas')
     nombre = models.CharField(max_length=150)
     tipo_contrato = models.CharField(max_length=30, choices=TipoContrato.choices)
     software = models.ForeignKey('catalogo.Producto', on_delete=models.PROTECT, db_column='software_id',
@@ -25,6 +28,7 @@ class PlantillaDocumento(models.Model):
         help_text="Indica si la plantilla usa un archivo .docx propio o el motor de cláusulas."
     )
     archivo_docx = models.FileField(upload_to='plantillas_contrato/%Y/%m/', null=True, blank=True)
+    ruta_plantilla_html = models.CharField(max_length=255, blank=True, null=True, help_text="Ruta del archivo HTML en el backend (ej: plantillas_html/mi_plantilla.html)")
     clausulas_seleccionadas = models.ManyToManyField('Clausula', blank=True, related_name='plantillas')
     version_codigo = models.CharField(max_length=32)
     activa = models.BooleanField(default=True)
@@ -51,7 +55,8 @@ class PlantillaDocumento(models.Model):
                 # como distinto. Ventana de carrera aceptable dado el volumen de uso
                 # (legal sube plantillas esporádicamente, no es endpoint de alto tráfico).
                 qs = PlantillaDocumento.objects.filter(
-                    tipo_contrato=self.tipo_contrato, software=self.software, activa=True,
+                    tenant=self.tenant, tipo_contrato=self.tipo_contrato,
+                    software=self.software, activa=True,
                 )
                 if self.pk:
                     qs = qs.exclude(pk=self.pk)
@@ -87,6 +92,8 @@ class DocumentoGenerado(models.Model):
 
 class Clausula(models.Model):
     id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='clausulas')
     categoria = models.CharField(max_length=100)
     nombre = models.CharField(max_length=200)
     RIESGO_CHOICES = [

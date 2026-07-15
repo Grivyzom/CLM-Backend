@@ -8,6 +8,8 @@ from django.contrib.auth.decorators import login_required
 from contratos.models import Contrato, TipoContrato
 from clientes.models import Cliente
 from clientes.views import get_filtered_clientes_unified
+from tenants.decorators import require_feature, require_tenant_write
+from tenants.scoping import QuotaExceeded, enforce_quota, scoped
 from .services import exportar, importar
 from .services.auditoria import (
     build_export_filename, build_audit_meta,
@@ -32,10 +34,12 @@ def _clientes_filtrados_ordenados(request):
     if ids_param:
         ids_ordenados = [int(x) for x in ids_param.split(',') if x.strip().isdigit()]
     else:
-        unified = get_filtered_clientes_unified(request.GET)
+        unified = get_filtered_clientes_unified(request.GET, request)
         ids_ordenados = [u['obj'].id for u in unified]
 
-    clientes_map = {c.id: c for c in Cliente.objects.filter(id__in=ids_ordenados)}
+    # scoped() también acota la selección manual por ids: no se puede exportar
+    # un cliente de otro tenant aunque se conozca su ID.
+    clientes_map = {c.id: c for c in scoped(Cliente.objects.all(), request).filter(id__in=ids_ordenados)}
     return [clientes_map[cid] for cid in ids_ordenados if cid in clientes_map]
 
 
@@ -49,9 +53,9 @@ def _contratos_filtrados_queryset(request):
          (ej. 'CTR-000041', también acepta '41' o 'ctr41') o su nombre (software
          licenciado / tipo de contrato). No busca por cliente — para eso está
          'cliente_id': mezclar ambos criterios en un solo texto es ambiguo.
-      4. Sin filtros: todos los registros.
+      4. Sin filtros: todos los registros (del tenant).
     """
-    qs = Contrato.objects.all()
+    qs = scoped(Contrato.objects.all(), request)
 
     ids_param = request.GET.get('ids', '').strip()
     if ids_param:
@@ -82,10 +86,25 @@ def _contratos_filtrados_queryset(request):
     return qs
 
 
+def _tenant_para_importar(request):
+    """Tenant destino de una importación. Superadmin debe indicar tenant_id."""
+    if request.user.tenant_id is not None:
+        return request.user.tenant, None
+    tenant_id = request.POST.get('tenant_id') or request.GET.get('tenant_id')
+    if not tenant_id:
+        return None, JsonResponse({'error': 'Superadmin debe indicar tenant_id.'}, status=400)
+    from tenants.models import Tenant
+    try:
+        return Tenant.objects.get(pk=tenant_id), None
+    except (Tenant.DoesNotExist, ValueError):
+        return None, JsonResponse({'error': 'Tenant inexistente.'}, status=400)
+
+
 # ─── EXPORTAR ─────────────────────────────────────────────────────────────────
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('descarga_masiva')
 def exportar_contratos_excel(request):
     qs = _contratos_filtrados_queryset(request)
     meta = build_audit_meta(
@@ -105,6 +124,7 @@ def exportar_contratos_excel(request):
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('descarga_masiva')
 def exportar_contratos_csv(request):
     qs = _contratos_filtrados_queryset(request)
     buf = exportar.contratos_a_csv(qs)
@@ -116,6 +136,7 @@ def exportar_contratos_csv(request):
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('descarga_masiva')
 def exportar_clientes_excel(request):
     clientes = _clientes_filtrados_ordenados(request)
     meta = build_audit_meta(
@@ -135,6 +156,7 @@ def exportar_clientes_excel(request):
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('descarga_masiva')
 def exportar_clientes_csv(request):
     clientes = _clientes_filtrados_ordenados(request)
     buf = exportar.clientes_a_csv(clientes)
@@ -146,9 +168,11 @@ def exportar_clientes_csv(request):
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('documentos')
 def exportar_contrato_word(request, contrato_id):
     try:
-        contrato = Contrato.objects.select_related('cliente', 'software', 'sla').get(id=contrato_id)
+        contrato = scoped(Contrato.objects.all(), request) \
+            .select_related('cliente', 'software', 'sla').get(id=contrato_id)
     except Contrato.DoesNotExist:
         return JsonResponse({"error": "Contrato no encontrado"}, status=404)
 
@@ -163,9 +187,11 @@ def exportar_contrato_word(request, contrato_id):
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('documentos')
 def exportar_contrato_pdf(request, contrato_id):
     try:
-        contrato = Contrato.objects.select_related('cliente', 'software', 'sla').get(id=contrato_id)
+        contrato = scoped(Contrato.objects.all(), request) \
+            .select_related('cliente', 'software', 'sla').get(id=contrato_id)
     except Contrato.DoesNotExist:
         return JsonResponse({"error": "Contrato no encontrado"}, status=404)
 
@@ -177,6 +203,7 @@ def exportar_contrato_pdf(request, contrato_id):
 
 @login_required
 @require_http_methods(["GET"])
+@require_feature('descarga_masiva')
 def exportar_reporte_contratos_pdf(request):
     """
     PDF paginado (nunca carga toda la tabla en un solo render: con 50k
@@ -219,35 +246,53 @@ def exportar_reporte_contratos_pdf(request):
 
 @login_required
 @require_http_methods(["POST"])
+@require_feature('documentos')
+@require_tenant_write
 def importar_clientes_excel(request):
     archivo = request.FILES.get("archivo")
     if not archivo:
         return JsonResponse({"error": "Se requiere campo 'archivo'"}, status=400)
 
-    import json
-    with open("/tmp/last_import.xlsx", "wb") as f:
-        for chunk in archivo.chunks():
-            f.write(chunk)
-    archivo.seek(0)
-    resultado = importar.excel_a_clientes(archivo)
-    with open("/tmp/import_log.txt", "w") as f:
-        f.write(json.dumps(resultado, indent=2))
+    tenant, error = _tenant_para_importar(request)
+    if error:
+        return error
+
+    # Bloquea el import si el tenant ya está en su límite; las filas creadas
+    # dentro del import pueden igual toparlo — el conteo fino es post-import.
+    try:
+        enforce_quota(tenant, 'clientes')
+    except QuotaExceeded as exc:
+        return JsonResponse(exc.detail, status=403)
+
+    resultado = importar.excel_a_clientes(archivo, tenant)
     return JsonResponse(resultado)
 
 
 @login_required
 @require_http_methods(["POST"])
+@require_feature('documentos')
+@require_tenant_write
 def importar_contratos_excel(request):
     archivo = request.FILES.get("archivo")
     if not archivo:
         return JsonResponse({"error": "Se requiere campo 'archivo'"}, status=400)
 
-    resultado = importar.excel_a_contratos(archivo)
+    tenant, error = _tenant_para_importar(request)
+    if error:
+        return error
+
+    try:
+        enforce_quota(tenant, 'contratos')
+    except QuotaExceeded as exc:
+        return JsonResponse(exc.detail, status=403)
+
+    resultado = importar.excel_a_contratos(archivo, tenant)
     return JsonResponse(resultado)
 
 
 @login_required
 @require_http_methods(["POST"])
+@require_feature('documentos')
 def extraer_pdf(request):
     """Extrae texto y tablas de un PDF. Devuelve JSON."""
     archivo = request.FILES.get("archivo")
@@ -266,6 +311,7 @@ def extraer_pdf(request):
 
 @login_required
 @require_http_methods(["POST"])
+@require_feature('documentos')
 def extraer_word(request):
     """Extrae texto y tablas de un Word. Devuelve JSON."""
     archivo = request.FILES.get("archivo")
@@ -284,6 +330,7 @@ def extraer_word(request):
 
 @login_required
 @require_http_methods(["POST"])
+@require_feature('documentos')
 def extraer_pptx(request):
     """Extrae texto de cada slide de un PPTX. Devuelve JSON."""
     archivo = request.FILES.get("archivo")

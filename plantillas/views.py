@@ -1,15 +1,19 @@
 from django.db.models import Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
+from django.conf import settings
+from pathlib import Path
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework import status
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 
 from contratos.models import Contrato, EtapaContrato
+from catalogo.models import Producto
+from tenants.permissions import DeleteRequiresTenantAdmin, IsTenantMember, RequiresFeature
+from tenants.scoping import resolve_tenant_for_write, scoped
 from .models import PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula, ModoOrigenPlantilla
 from .services.validacion import validar_docx_subido
 from .services.renderizado import (
@@ -24,6 +28,27 @@ ETAPAS_CON_DOCUMENTO_EMITIDO = {
     EtapaContrato.PENDIENTE_FIRMA, EtapaContrato.ACTIVO,
     EtapaContrato.ENMENDADO, EtapaContrato.TERMINADO,
 }
+
+
+def _available_html_templates():
+    """Lista de rutas relativas bajo templates/plantillas_html/*.html.
+
+    Única fuente de verdad para el dropdown del frontend (AvailableHtmlTemplatesView)
+    y para validar server-side que `ruta_plantilla_html` no apunte a un template
+    Django fuera de esa carpeta (render_to_string resuelve contra todos los
+    directorios de templates del proyecto, no solo este)."""
+    import os
+
+    base_dir = Path(settings.BASE_DIR) / 'templates' / 'plantillas_html'
+    templates = []
+    if base_dir.exists():
+        for root, dirs, files in os.walk(base_dir):
+            for f in files:
+                if f.endswith('.html'):
+                    rel_path = os.path.relpath(os.path.join(root, f), base_dir)
+                    rel_path = rel_path.replace('\\', '/')
+                    templates.append(f'plantillas_html/{rel_path}')
+    return templates
 
 
 def _plantilla_a_dict(p: PlantillaDocumento):
@@ -43,6 +68,7 @@ def _plantilla_a_dict(p: PlantillaDocumento):
         'fecha_creacion': p.fecha_creacion,
         'usos': usos,
         'clausulas_seleccionadas': list(p.clausulas_seleccionadas.values_list('id', flat=True)),
+        'ruta_plantilla_html': p.ruta_plantilla_html if p.modo_origen == 'html' else None,
     }
 
 
@@ -64,13 +90,14 @@ class PlantillaListCreateView(APIView):
     POST /api/plantillas/plantillas/  (multipart: nombre, tipo_contrato, version_codigo,
                                         archivo_docx, software opcional, activa opcional)
 
-    Listar es para cualquier usuario autenticado (el modal de Nuevo Contrato
-    necesita las plantillas); registrar/modificar queda reservado a staff.
+    Listar es para cualquier miembro del tenant (el modal de Nuevo Contrato
+    necesita las plantillas); registrar/modificar queda reservado al
+    Administrador de Cuenta del tenant (o superadmin).
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request):
-        qs = PlantillaDocumento.objects.select_related('software').all()
+        qs = scoped(PlantillaDocumento.objects.all(), request).select_related('software')
         tipo_contrato = request.GET.get('tipo_contrato')
         software_id = request.GET.get('software')
         activa = request.GET.get('activa')
@@ -92,9 +119,9 @@ class PlantillaListCreateView(APIView):
         return Response([_plantilla_a_dict(p) for p in qs])
 
     def post(self, request):
-        if not request.user.is_staff:
+        if request.user.tenant_id is not None and not request.user.is_tenant_admin:
             return Response(
-                {'error': 'Solo administradores pueden registrar plantillas.'},
+                {'error': 'Solo el Administrador de Cuenta puede registrar plantillas.'},
                 status=status.HTTP_403_FORBIDDEN,
             )
         nombre = request.data.get('nombre')
@@ -118,6 +145,8 @@ class PlantillaListCreateView(APIView):
             raise DRFValidationError(errors)
 
         archivo = request.FILES.get('archivo_docx')
+        ruta_plantilla_html = request.data.get('ruta_plantilla_html')
+        
         if modo_origen == ModoOrigenPlantilla.ARCHIVO:
             if not archivo:
                 raise DRFValidationError({'archivo_docx': 'Se requiere un archivo .docx para el modo "archivo".'})
@@ -125,15 +154,26 @@ class PlantillaListCreateView(APIView):
                 validar_docx_subido(archivo)
             except DjangoValidationError as exc:
                 raise DRFValidationError({'archivo_docx': exc.messages})
+        elif modo_origen == ModoOrigenPlantilla.HTML:
+            if not ruta_plantilla_html or not str(ruta_plantilla_html).strip():
+                raise DRFValidationError({'ruta_plantilla_html': 'Se requiere seleccionar una ruta de plantilla HTML.'})
+            if ruta_plantilla_html not in _available_html_templates():
+                raise DRFValidationError({'ruta_plantilla_html': 'Ruta de plantilla HTML no reconocida.'})
+
+        tenant = resolve_tenant_for_write(request, request.data)
+        if software_id and not Producto.objects.filter(pk=software_id, tenant=tenant).exists():
+            raise DRFValidationError({'software': 'Producto no encontrado.'})
 
         activa = str(request.data.get('activa', 'true')).lower() in ('1', 'true', 'si')
 
         plantilla = PlantillaDocumento.objects.create(
+            tenant=tenant,
             nombre=nombre,
             tipo_contrato=tipo_contrato,
             software_id=software_id,
             modo_origen=modo_origen,
-            archivo_docx=archivo,
+            archivo_docx=archivo if modo_origen == ModoOrigenPlantilla.ARCHIVO else None,
+            ruta_plantilla_html=ruta_plantilla_html if modo_origen == ModoOrigenPlantilla.HTML else None,
             version_codigo=version_codigo,
             activa=activa,
             subida_por=request.user,
@@ -157,15 +197,20 @@ class PlantillaDetailView(APIView):
     PATCH /api/plantillas/plantillas/<id>/   (solo permite alternar {"activa": bool};
                                                para cambiar el .docx se sube una plantilla nueva)
     """
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request, pk):
-        plantilla = get_object_or_404(PlantillaDocumento, pk=pk)
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
         return Response(_plantilla_a_dict(plantilla))
 
     def patch(self, request, pk):
-        plantilla = get_object_or_404(PlantillaDocumento, pk=pk)
-        
+        if request.user.tenant_id is not None and not request.user.is_tenant_admin:
+            return Response(
+                {'error': 'Solo el Administrador de Cuenta puede modificar plantillas.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+
         if 'activa' in request.data:
             plantilla.activa = str(request.data.get('activa')).lower() in ('1', 'true', 'si')
             
@@ -190,6 +235,15 @@ class PlantillaDetailView(APIView):
                     raise DRFValidationError({'archivo_docx': exc.messages})
                 plantilla.archivo_docx = archivo
 
+        if 'ruta_plantilla_html' in request.data:
+            nueva_ruta = request.data.get('ruta_plantilla_html')
+            if plantilla.modo_origen == ModoOrigenPlantilla.HTML:
+                if not str(nueva_ruta).strip():
+                    raise DRFValidationError({'ruta_plantilla_html': 'Se requiere seleccionar una ruta de plantilla HTML.'})
+                if nueva_ruta not in _available_html_templates():
+                    raise DRFValidationError({'ruta_plantilla_html': 'Ruta de plantilla HTML no reconocida.'})
+            plantilla.ruta_plantilla_html = nueva_ruta
+
         clausulas_str = request.data.get('clausulas_seleccionadas')
         if clausulas_str is not None:
             import json
@@ -210,9 +264,10 @@ class PlantillaPreviewPDFView(APIView):
     para previsualizarla embebida en el catálogo. Solo aplica a plantillas
     modo 'archivo'; las de cláusulas no tienen documento base.
     """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request, pk):
-        plantilla = get_object_or_404(PlantillaDocumento, pk=pk)
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
         if plantilla.modo_origen == ModoOrigenPlantilla.ARCHIVO and not plantilla.archivo_docx:
             return Response(
                 {'error': 'Esta plantilla en modo archivo no tiene un documento base (.docx) para previsualizar.'},
@@ -234,19 +289,48 @@ class PlantillaPreviewPDFView(APIView):
         return response
 
 
+class PlantillaRegenerarPreviewView(APIView):
+    """POST /api/plantillas/plantillas/<id>/regenerar-preview/"""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def post(self, request, pk):
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        
+        cache_dir = Path(settings.MEDIA_ROOT) / 'plantillas_previews'
+        if cache_dir.exists():
+            for f in cache_dir.glob(f"plantilla_{plantilla.id}_*.pdf"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+                    
+        return Response({'status': 'ok'})
+
+
+class AvailableHtmlTemplatesView(APIView):
+    """GET /api/plantillas/html-templates/"""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request):
+        return Response(_available_html_templates())
+
+
 class DocumentoGeneradoListView(APIView):
     """GET /api/plantillas/documentos/?contrato_id=<id> — historial de un contrato."""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request):
         contrato_id = request.GET.get('contrato_id')
         if not contrato_id:
             raise DRFValidationError({'contrato_id': 'Este parámetro es requerido.'})
-        qs = DocumentoGenerado.objects.filter(contrato_id=contrato_id).select_related('plantilla')
+        qs = scoped(DocumentoGenerado.objects.all(), request, 'contrato__tenant') \
+            .filter(contrato_id=contrato_id).select_related('plantilla')
         return Response([_documento_a_dict(d) for d in qs])
 
 
 class GenerarDocumentoView(APIView):
     """POST /api/plantillas/documentos/generar/  {contrato_id, plantilla_id?, forzar?}"""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def post(self, request):
         contrato_id = request.data.get('contrato_id')
@@ -254,7 +338,8 @@ class GenerarDocumentoView(APIView):
             raise DRFValidationError({'contrato_id': 'Este campo es requerido.'})
 
         contrato = get_object_or_404(
-            Contrato.objects.select_related('cliente', 'software', 'sla'), pk=contrato_id,
+            scoped(Contrato.objects.all(), request).select_related('cliente', 'software', 'sla'),
+            pk=contrato_id,
         )
 
         forzar = str(request.data.get('forzar', 'false')).lower() in ('1', 'true', 'si')
@@ -274,7 +359,10 @@ class GenerarDocumentoView(APIView):
         plantilla = None
         plantilla_id = request.data.get('plantilla_id')
         if plantilla_id:
-            plantilla = get_object_or_404(PlantillaDocumento, pk=plantilla_id)
+            # La plantilla debe pertenecer al mismo tenant que el contrato.
+            plantilla = get_object_or_404(
+                PlantillaDocumento.objects.filter(tenant=contrato.tenant), pk=plantilla_id,
+            )
 
         try:
             documento = generar_documento(contrato, plantilla=plantilla, usuario=request.user)
@@ -299,9 +387,12 @@ class DescargarPDFView(APIView):
     Con `?inline=1` se sirve sin Content-Disposition: attachment, para
     previsualizarlo embebido (iframe) en el workspace del contrato.
     """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request, pk):
-        documento = get_object_or_404(DocumentoGenerado, pk=pk)
+        documento = get_object_or_404(
+            scoped(DocumentoGenerado.objects.all(), request, 'contrato__tenant'), pk=pk,
+        )
         inline = request.GET.get('inline', '').lower() in ('1', 'true', 'si')
         response = FileResponse(
             documento.archivo_pdf.open('rb'), as_attachment=not inline,
@@ -315,11 +406,20 @@ class DescargarPDFView(APIView):
 
 
 class DescargarDocxView(APIView):
-    """GET /api/plantillas/documentos/<id>/docx/ — solo staff, para auditoría interna."""
-    permission_classes = [IsAdminUser]
+    """GET /api/plantillas/documentos/<id>/docx/ — auditoría interna: superadmin,
+    Administrador de Cuenta o Auditor Legal del tenant."""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request, pk):
-        documento = get_object_or_404(DocumentoGenerado, pk=pk)
+        user = request.user
+        if user.tenant_id is not None and not (user.is_tenant_admin or user.is_auditor):
+            return Response(
+                {'error': 'Requiere rol Administrador de Cuenta o Auditor Legal.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        documento = get_object_or_404(
+            scoped(DocumentoGenerado.objects.all(), request, 'contrato__tenant'), pk=pk,
+        )
         return FileResponse(
             documento.archivo_docx.open('rb'), as_attachment=True,
             filename=f"contrato_{documento.contrato_id}_interno.docx",
@@ -330,8 +430,10 @@ class ClausulaListView(APIView):
     """
     GET /api/plantillas/clausulas/
     """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
     def get(self, request):
-        qs = Clausula.objects.prefetch_related('versiones').filter(activa=True)
+        qs = scoped(Clausula.objects.all(), request).prefetch_related('versiones').filter(activa=True)
         data = []
         for c in qs:
             versions = [
@@ -353,9 +455,11 @@ class ClausulaListView(APIView):
 
     def post(self, request):
         data = request.data
+        tenant = resolve_tenant_for_write(request, data)
         try:
             with transaction.atomic():
                 clausula = Clausula.objects.create(
+                    tenant=tenant,
                     categoria=data.get('cat', 'General'),
                     nombre=data.get('name', 'Nueva Cláusula'),
                     riesgo=data.get('risk', 'Medio'),
@@ -381,8 +485,10 @@ class ClausulaDetailView(APIView):
     PUT /api/plantillas/clausulas/<pk>/
     DELETE /api/plantillas/clausulas/<pk>/
     """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas'), DeleteRequiresTenantAdmin]
+
     def put(self, request, pk):
-        clausula = get_object_or_404(Clausula, pk=pk)
+        clausula = get_object_or_404(scoped(Clausula.objects.all(), request), pk=pk)
         data = request.data
         try:
             with transaction.atomic():
@@ -432,7 +538,7 @@ class ClausulaDetailView(APIView):
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
             
     def delete(self, request, pk):
-        clausula = get_object_or_404(Clausula, pk=pk)
+        clausula = get_object_or_404(scoped(Clausula.objects.all(), request), pk=pk)
         # Soft delete
         clausula.activa = False
         clausula.save()
@@ -451,18 +557,16 @@ class EmitidosListView(APIView):
         - fecha_desde / fecha_hasta: rango de fecha_generacion (YYYY-MM-DD)
         - page / page_size: paginación (default page_size=20, max=100)
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request):
-        from contratos.models import Contrato
-
         try:
             page = max(1, int(request.query_params.get('page', 1)))
             page_size = min(100, max(1, int(request.query_params.get('page_size', 20))))
         except (ValueError, TypeError):
             page, page_size = 1, 20
 
-        qs = DocumentoGenerado.objects.select_related(
+        qs = scoped(DocumentoGenerado.objects.all(), request, 'contrato__tenant').select_related(
             'plantilla', 'contrato', 'contrato__cliente',
             'contrato__software', 'generado_por',
         ).order_by('-fecha_generacion')

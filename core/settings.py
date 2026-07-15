@@ -36,7 +36,7 @@ if not SECRET_KEY:
 # Default False (seguro) — se activa solo si .env trae DEBUG=True.
 DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
 
-ALLOWED_HOSTS = ['144.217.10.38', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['144.217.10.38', 'clm.grivyzom.com', 'localhost', '127.0.0.1']
 
 # Metadatos de auditoría inyectados en documentos exportados (ver documentos/services/exportar.py)
 APP_NAME = 'Enfoque Platform'
@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
+    'tenants',
     'core',
     'clientes',
     'catalogo',
@@ -61,7 +62,10 @@ INSTALLED_APPS = [
     'legal',
     'documentos',
     'plantillas',
+    'requerimientos',
     'analytics',
+    'incidencias',
+    'notificaciones',
     'axes',
     'django_otp',
     'django_otp.plugins.otp_totp',
@@ -74,6 +78,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'core.middleware.ClienteBloqueadoMiddleware',
     'django_otp.middleware.OTPMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
@@ -100,6 +105,10 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'core.wsgi.application'
+
+# Multi-tenant: usuario custom con FK a Tenant (tenants/models.py).
+# tenant=None ⇒ staff global de la plataforma (superadmin).
+AUTH_USER_MODEL = 'tenants.User'
 
 
 # Database
@@ -167,6 +176,9 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 LIBREOFFICE_BINARY = os.environ.get('LIBREOFFICE_BINARY', 'soffice')
 PLANTILLAS_MAX_UPLOAD_MB = int(os.environ.get('PLANTILLAS_MAX_UPLOAD_MB', 10))
 
+# Adjuntos de incidencias (capturas/logs, ver app 'incidencias')
+INCIDENCIAS_MAX_UPLOAD_MB = int(os.environ.get('INCIDENCIAS_MAX_UPLOAD_MB', 10))
+
 # ==========================================
 # CONFIGURACIONES DE SEGURIDAD GRADO MILITAR
 # ==========================================
@@ -185,8 +197,8 @@ AXES_LOCKOUT_PARAMETERS = [["username", "ip_address"]] # Bloquear por combinaci�
 
 # 3. Seguridad de Sesiones y Cookies
 # NOTA: En producción (HTTPS) cambiar SESSION_COOKIE_SECURE y CSRF_COOKIE_SECURE a True
-SESSION_COOKIE_SECURE = False      # False para desarrollo HTTP local
-CSRF_COOKIE_SECURE = False         # False para desarrollo HTTP local
+SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', str(not DEBUG)).lower() == 'true'
+CSRF_COOKIE_SECURE = os.environ.get('CSRF_COOKIE_SECURE', str(not DEBUG)).lower() == 'true'
 SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = 'Lax'   # Lax permite cookies desde el frontend Vite en dev
@@ -203,6 +215,14 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.UserRateThrottle',
+        'rest_framework.throttling.AnonRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'user': '300/min',
+        'anon': '60/min',
+    },
 }
 
 # ==========================================
@@ -216,6 +236,8 @@ CORS_ALLOWED_ORIGINS = [
     'http://127.0.0.1:5173',
     'http://144.217.10.38',
     'https://144.217.10.38',
+    'http://clm.grivyzom.com',
+    'https://clm.grivyzom.com',
 ]
 CORS_ALLOW_CREDENTIALS = True
 CSRF_TRUSTED_ORIGINS = [
@@ -227,5 +249,21 @@ CSRF_TRUSTED_ORIGINS = [
     'http://144.217.10.38:5173',
     'http://144.217.10.38',
     'https://144.217.10.38',
+    'http://clm.grivyzom.com',
+    'https://clm.grivyzom.com',
 ]
 
+# ==========================================
+# EMAIL CONFIGURATION (Hostinger)
+# ==========================================
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST = 'smtp.hostinger.com'
+EMAIL_PORT = 465
+EMAIL_USE_SSL = True
+EMAIL_HOST_USER = 'no-reply@grivyzom.com'
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = 'Enfoque Platform <no-reply@grivyzom.com>'
+
+# Base para los enlaces que van en correos (reset de contraseña, etc.).
+# Nunca derivar del Host header de la request (host header injection).
+FRONTEND_BASE_URL = os.environ.get('FRONTEND_BASE_URL', 'https://clm.grivyzom.com')

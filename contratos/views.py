@@ -7,7 +7,6 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework import status as http_status
 
@@ -20,6 +19,8 @@ from .models import (
     ObligacionSLA, ObligacionSLAAuditLog,
 )
 from django.core.exceptions import ValidationError
+from tenants.permissions import DeleteRequiresTenantAdmin, EditRequiresPermiso, IsPlatformClienteAccess, IsTenantMember, RequiresFeature
+from tenants.scoping import enforce_quota, resolve_tenant_for_write, scoped
 
 MESES_ES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
 DIAS_SEMANA_ES = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
@@ -58,6 +59,20 @@ ETAPAS_PIPELINE = [
 ]
 
 
+def _cliente_qparam(request):
+    """Lee ?cliente= — la "Vista activa" del frontend manda este parámetro para
+    acotar las métricas a un solo cliente. Un valor no numérico se ignora
+    (equivale a la vista global); scoped() ya garantiza que un id de otro
+    tenant no devuelva datos ajenos."""
+    raw = request.query_params.get('cliente')
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class DashboardView(APIView):
     """
     GET /api/dashboard/
@@ -65,7 +80,23 @@ class DashboardView(APIView):
     requieren acción y actividad reciente. Todas las métricas se derivan de
     datos reales; sin datos cargados los valores caen a cero/listas vacías.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
+
+    # Querysets base acotados al tenant del solicitante (superadmin ve todo).
+    # Con ?cliente= (vista de cliente activa) se acotan además a ese cliente.
+    def _contratos(self):
+        qs = scoped(Contrato.objects.all(), self.request)
+        cliente_id = _cliente_qparam(self.request)
+        if cliente_id:
+            qs = qs.filter(cliente_id=cliente_id)
+        return qs
+
+    def _clientes(self):
+        qs = scoped(Cliente.objects.all(), self.request)
+        cliente_id = _cliente_qparam(self.request)
+        if cliente_id:
+            qs = qs.filter(pk=cliente_id)
+        return qs
 
     def get(self, request):
         today = timezone.localdate()
@@ -85,16 +116,16 @@ class DashboardView(APIView):
         prev_month_anchor = _shift_months(today, -1)
         prev_start, prev_end = _month_bounds(prev_month_anchor)
 
-        contratos_activos = Contrato.objects.filter(status=EstadoContrato.ACTIVO).count()
-        nuevos_contratos_mes = Contrato.objects.filter(
+        contratos_activos = self._contratos().filter(status=EstadoContrato.ACTIVO).count()
+        nuevos_contratos_mes = self._contratos().filter(
             fecha_inicio__gte=month_start, fecha_inicio__lte=month_end
         ).count()
 
         clientes_activos = (
-            Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+            self._contratos().filter(status=EstadoContrato.ACTIVO)
             .values('cliente_id').distinct().count()
         )
-        clientes_nuevos_mes = Cliente.objects.filter(
+        clientes_nuevos_mes = self._clientes().filter(
             fecha_registro__date__gte=month_start, fecha_registro__date__lte=month_end
         ).count()
 
@@ -105,18 +136,18 @@ class DashboardView(APIView):
         else:
             variacion_mrr = 100.0 if mrr > 0 else 0.0
 
-        renov_30 = Contrato.objects.filter(
+        renov_30 = self._contratos().filter(
             status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA],
             fecha_vencimiento__gte=today,
             fecha_vencimiento__lte=today + timedelta(days=30),
         ).aggregate(n=Count('id'), monto=Sum('monto'))
 
-        requieren_accion = Contrato.objects.filter(
+        requieren_accion = self._contratos().filter(
             Q(status__in=[EstadoContrato.MORA, EstadoContrato.GRACIA]) |
             Q(status=EstadoContrato.ACTIVO, fecha_vencimiento__lte=today + timedelta(days=7))
         ).count()
 
-        sin_documento = Contrato.objects.filter(
+        sin_documento = self._contratos().filter(
             status=EstadoContrato.ACTIVO, documentos_generados__isnull=True
         ).distinct().count()
 
@@ -131,7 +162,7 @@ class DashboardView(APIView):
 
     def _mrr_en(self, start, end):
         """MRR de contratos RECURRENTE cuyo rango de vigencia solapa [start, end]."""
-        total = Contrato.objects.filter(
+        total = self._contratos().filter(
             tipo_contrato=TipoContrato.RECURRENTE,
             fecha_inicio__lte=end,
         ).filter(
@@ -141,7 +172,8 @@ class DashboardView(APIView):
 
     # ── Serie MRR (6 meses, por software; top 5 + "Otros") ───────────────────
     def _build_mrr_series(self, today, max_series=5):
-        softwares = list(Producto.objects.filter(categoria='Software').order_by('nombre'))
+        softwares = list(scoped(Producto.objects.all(), self.request)
+                         .filter(categoria='Software').order_by('nombre'))
         meses = [_shift_months(today, -i) for i in range(5, -1, -1)]
 
         # Matriz cruda: software → [mrr en $k por mes]
@@ -151,7 +183,7 @@ class DashboardView(APIView):
             m_start, m_end = _month_bounds(mes_anchor)
             etiquetas_mes.append(MESES_ES[mes_anchor.month - 1])
             for sw in softwares:
-                mrr = Contrato.objects.filter(
+                mrr = self._contratos().filter(
                     software=sw,
                     tipo_contrato=TipoContrato.RECURRENTE,
                     fecha_inicio__lte=m_end,
@@ -187,7 +219,7 @@ class DashboardView(APIView):
     def _build_pipeline(self):
         agregados = {
             row['etapa']: row
-            for row in Contrato.objects.filter(etapa__in=ETAPAS_PIPELINE)
+            for row in self._contratos().filter(etapa__in=ETAPAS_PIPELINE)
             .values('etapa').annotate(n=Count('id'), monto=Sum('monto'))
         }
         labels = dict(EtapaContrato.choices)
@@ -206,7 +238,7 @@ class DashboardView(APIView):
         buckets = [('0–30 días', 0, 30), ('31–60 días', 31, 60), ('61–90 días', 61, 90)]
         results = []
         for label, desde, hasta in buckets:
-            agg = Contrato.objects.filter(
+            agg = self._contratos().filter(
                 status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA],
                 fecha_vencimiento__gte=today + timedelta(days=desde),
                 fecha_vencimiento__lte=today + timedelta(days=hasta),
@@ -221,9 +253,12 @@ class DashboardView(APIView):
     # ── Actividad reciente (cambios de etapa) ────────────────────────────────
     def _build_actividad(self, limit=8):
         labels = dict(EtapaContrato.choices)
+        qs = scoped(HistorialEtapaContrato.objects.all(), self.request, 'contrato__tenant')
+        cliente_id = _cliente_qparam(self.request)
+        if cliente_id:
+            qs = qs.filter(contrato__cliente_id=cliente_id)
         qs = (
-            HistorialEtapaContrato.objects
-            .select_related('contrato__cliente', 'contrato__software', 'usuario')
+            qs.select_related('contrato__cliente', 'contrato__software', 'usuario')
             .order_by('-fecha_cambio')[:limit]
         )
         return [
@@ -242,7 +277,7 @@ class DashboardView(APIView):
 
     # ── Tabla de contratos que requieren acción ──────────────────────────────
     def _build_urgent_contracts(self, today, limit=50):
-        qs = Contrato.objects.filter(
+        qs = self._contratos().filter(
             status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA, EstadoContrato.MORA]
         ).filter(
             Q(fecha_vencimiento__lte=today + timedelta(days=7)) |
@@ -299,12 +334,38 @@ def _sla_a_dict(s):
 
 
 class SLAListView(APIView):
-    """GET /api/slas/ — catálogo de SLA (para selects y obligaciones de contrato)."""
-    permission_classes = [IsAuthenticated]
+    """GET  /api/slas/ — catálogo de SLA del tenant (para selects y obligaciones).
+    POST /api/slas/ — crea un SLA propio del tenant."""
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
 
     def get(self, request):
-        qs = SLA.objects.all().order_by('nombre')
+        qs = scoped(SLA.objects.all(), request).order_by('nombre')
         return Response([_sla_a_dict(s) for s in qs])
+
+    def post(self, request):
+        data = request.data
+        nombre = (data.get('nombre') or '').strip()
+        if not nombre:
+            raise DRFValidationError({'nombre': 'Este campo es requerido.'})
+
+        tenant = resolve_tenant_for_write(request, data)
+        if SLA.objects.filter(tenant=tenant, nombre__iexact=nombre).exists():
+            raise DRFValidationError({'nombre': 'Ya existe un SLA con ese nombre.'})
+
+        try:
+            uptime = Decimal(str(data.get('uptime_garantizado', '99.9')))
+            horas = int(data.get('tiempo_respuesta_horas', 24))
+        except (InvalidOperation, TypeError, ValueError):
+            raise DRFValidationError({'error': 'uptime_garantizado u horas inválidos.'})
+
+        sla = SLA.objects.create(
+            tenant=tenant,
+            nombre=nombre,
+            uptime_garantizado=uptime,
+            tiempo_respuesta_horas=horas,
+            detalles=data.get('detalles', ''),
+        )
+        return Response(_sla_a_dict(sla), status=http_status.HTTP_201_CREATED)
 
 
 # ─── Contratos: CRUD ──────────────────────────────────────────────────────────
@@ -394,7 +455,7 @@ class ContratoListCreateView(APIView):
             fecha_vencimiento?, frecuencia_facturacion? (requerido si tipo_contrato=RECURRENTE),
             dias_gracia_autorizados? }
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [(IsTenantMember & RequiresFeature('contratos')) | IsPlatformClienteAccess]
 
     def get(self, request):
         try:
@@ -403,7 +464,7 @@ class ContratoListCreateView(APIView):
         except (ValueError, TypeError):
             page, page_size = 1, 20
 
-        qs = Contrato.objects.select_related('cliente', 'software', 'sla').all()
+        qs = scoped(Contrato.objects.all(), request, cliente_field='cliente_id').select_related('cliente', 'software', 'sla')
 
         search = request.query_params.get('search', '').strip()
         if search:
@@ -549,17 +610,23 @@ class ContratoListCreateView(APIView):
         if errors:
             raise DRFValidationError(errors)
 
-        if not Cliente.objects.filter(pk=cliente_id).exists():
+        tenant = resolve_tenant_for_write(request, data)
+        enforce_quota(tenant, 'contratos')
+
+        # Las referencias deben pertenecer al mismo tenant: evita colgar un
+        # contrato propio de un cliente/producto/SLA de otra empresa.
+        if not Cliente.objects.filter(pk=cliente_id, tenant=tenant).exists():
             raise DRFValidationError({'cliente_id': 'Cliente no encontrado.'})
-        if not Producto.objects.filter(pk=software_id).exists():
+        if not Producto.objects.filter(pk=software_id, tenant=tenant).exists():
             raise DRFValidationError({'software_id': 'Producto no encontrado.'})
-        if not SLA.objects.filter(pk=sla_id).exists():
+        if not SLA.objects.filter(pk=sla_id, tenant=tenant).exists():
             raise DRFValidationError({'sla_id': 'SLA no encontrado.'})
 
         from django.db import transaction, IntegrityError
         try:
             with transaction.atomic():
                 contrato = Contrato.objects.create(
+                    tenant=tenant,
                     cliente_id=cliente_id,
                     software_id=software_id,
                     sla_id=sla_id,
@@ -686,7 +753,7 @@ def _contrato_detail_dict(c):
 
     try:
         from plantillas.services.renderizado import resolver_plantilla_activa, SinPlantillaActivaError
-        plantilla_activa_obj = resolver_plantilla_activa(c.tipo_contrato, c.software_id)
+        plantilla_activa_obj = resolver_plantilla_activa(c.tipo_contrato, c.software_id, c.tenant)
         plantilla_activa_info = {
             'id': plantilla_activa_obj.id,
             'nombre': plantilla_activa_obj.nombre,
@@ -737,16 +804,23 @@ class ContratoDetailView(APIView):
     PATCH  /api/contratos/<id>/   — actualiza campos comerciales o transiciona etapa
     DELETE /api/contratos/<id>/   — solo permitido en etapa BORRADOR
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [
+        (IsTenantMember & RequiresFeature('contratos') & DeleteRequiresTenantAdmin & EditRequiresPermiso('contratos'))
+        | IsPlatformClienteAccess
+    ]
 
     def get(self, request, pk):
         c = get_object_or_404(
-            Contrato.objects.select_related('cliente', 'software', 'sla'), pk=pk
+            scoped(Contrato.objects.all(), request, cliente_field='cliente_id')
+            .select_related('cliente', 'software', 'sla'), pk=pk
         )
         return Response(_contrato_detail_dict(c))
 
     def patch(self, request, pk):
-        c = get_object_or_404(Contrato.objects.select_related('cliente', 'software', 'sla'), pk=pk)
+        c = get_object_or_404(
+            scoped(Contrato.objects.all(), request, cliente_field='cliente_id')
+            .select_related('cliente', 'software', 'sla'), pk=pk
+        )
         data = request.data
 
         nueva_etapa = data.get('etapa')
@@ -754,6 +828,14 @@ class ContratoDetailView(APIView):
             if nueva_etapa not in EtapaContrato.values:
                 raise DRFValidationError({'etapa': 'Etapa inválida.'})
             c.transicionar_etapa(nueva_etapa, usuario=request.user, notas=data.get('notas', ''))
+
+        if 'sla_id' in data and data['sla_id'] is not None:
+            # El SLA referenciado debe pertenecer al mismo tenant que el
+            # contrato (mismo chequeo que en la creación, ver línea ~596) -
+            # si no, se filtra el nombre/uptime/tiempo_respuesta de un SLA
+            # ajeno vía el detalle del contrato.
+            if not SLA.objects.filter(pk=data['sla_id'], tenant=c.tenant_id).exists():
+                raise DRFValidationError({'sla_id': 'SLA no encontrado.'})
 
         campo_simple = [
             'monto', 'status', 'sla_id', 'fecha_vencimiento',
@@ -771,7 +853,7 @@ class ContratoDetailView(APIView):
         return Response(_contrato_detail_dict(c))
 
     def delete(self, request, pk):
-        c = get_object_or_404(Contrato, pk=pk)
+        c = get_object_or_404(scoped(Contrato.objects.all(), request), pk=pk)
         if c.etapa != EtapaContrato.BORRADOR:
             return Response(
                 {'error': 'Solo se pueden eliminar contratos en etapa Borrador.'},
@@ -783,7 +865,7 @@ class ContratoDetailView(APIView):
 
 class ContratoStatsView(APIView):
     """GET /api/contratos/stats/ — KPIs para el StatsStrip de la vista Contratos."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
 
     PIPELINE_ETAPAS = [
         EtapaContrato.BORRADOR, EtapaContrato.REVISION,
@@ -793,7 +875,12 @@ class ContratoStatsView(APIView):
     def get(self, request):
         today = timezone.localdate()
 
-        activos = Contrato.objects.filter(status=EstadoContrato.ACTIVO)
+        base = scoped(Contrato.objects.all(), request)
+        cliente_id = _cliente_qparam(request)
+        if cliente_id:
+            base = base.filter(cliente_id=cliente_id)
+
+        activos = base.filter(status=EstadoContrato.ACTIVO)
         contratos_activos = activos.count()
 
         # Agregación en SQL (evita traer miles de filas a Python).
@@ -807,13 +894,13 @@ class ContratoStatsView(APIView):
         )['total'] or Decimal('0')
         arr_total = mrr_total * Decimal('12')
 
-        por_renovar = Contrato.objects.filter(
+        por_renovar = base.filter(
             status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA],
             fecha_vencimiento__gte=today,
             fecha_vencimiento__lte=today + timedelta(days=60),
         ).count()
 
-        en_pipeline = Contrato.objects.filter(etapa__in=self.PIPELINE_ETAPAS).count()
+        en_pipeline = base.filter(etapa__in=self.PIPELINE_ETAPAS).count()
 
         return Response({
             'contratos_activos': contratos_activos,
@@ -825,10 +912,10 @@ class ContratoStatsView(APIView):
 
 
 class ObligacionListCreateView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
 
     def get(self, request, contrato_id):
-        contrato = get_object_or_404(Contrato, pk=contrato_id)
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=contrato_id)
         obs = contrato.obligaciones.all().order_by('id')
         data = [
             {
@@ -842,7 +929,7 @@ class ObligacionListCreateView(APIView):
         return Response(data)
 
     def post(self, request, contrato_id):
-        contrato = get_object_or_404(Contrato, pk=contrato_id)
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=contrato_id)
         if contrato.etapa != EtapaContrato.BORRADOR:
             return Response(
                 {'error': 'No se pueden añadir obligaciones a un contrato que no esté en estado Borrador.'},
@@ -880,10 +967,10 @@ class ObligacionListCreateView(APIView):
 
 
 class ObligacionDetailView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('contratos'), DeleteRequiresTenantAdmin]
 
     def patch(self, request, pk):
-        ob = get_object_or_404(ObligacionSLA, pk=pk)
+        ob = get_object_or_404(scoped(ObligacionSLA.objects.all(), request, 'contrato__tenant'), pk=pk)
         if ob.contrato.etapa != EtapaContrato.BORRADOR:
             return Response(
                 {'error': 'No se pueden editar obligaciones de un contrato que no esté en estado Borrador.'},
@@ -911,7 +998,7 @@ class ObligacionDetailView(APIView):
         })
 
     def delete(self, request, pk):
-        ob = get_object_or_404(ObligacionSLA, pk=pk)
+        ob = get_object_or_404(scoped(ObligacionSLA.objects.all(), request, 'contrato__tenant'), pk=pk)
         if ob.contrato.etapa != EtapaContrato.BORRADOR:
             return Response(
                 {'error': 'No se pueden eliminar obligaciones de un contrato que no esté en estado Borrador.'},
@@ -927,10 +1014,11 @@ class ObligacionDetailView(APIView):
 
 
 class ObligacionHistorialView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
 
     def get(self, request, pk):
-        logs = ObligacionSLAAuditLog.objects.filter(obligacion_id=pk).order_by('-fecha_cambio')
+        logs = scoped(ObligacionSLAAuditLog.objects.all(), request, 'contrato__tenant') \
+            .filter(obligacion_id=pk).order_by('-fecha_cambio')
         data = [
             {
                 'id': log.id,
@@ -946,18 +1034,20 @@ class ObligacionHistorialView(APIView):
 
 
 class ContratoEnmendarView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
 
     def post(self, request, pk):
-        contrato = get_object_or_404(Contrato, pk=pk)
-        
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=pk)
+        enforce_quota(contrato.tenant, 'contratos')
+
         from django.db import transaction
         with transaction.atomic():
             root = contrato.parent_contrato if contrato.parent_contrato else contrato
             num_versions = Contrato.objects.filter(parent_contrato=root).count()
             next_version = f"{num_versions + 2}.0"
-            
+
             nuevo_contrato = Contrato.objects.create(
+                tenant=contrato.tenant,
                 cliente=contrato.cliente,
                 software=contrato.software,
                 sla=contrato.sla,

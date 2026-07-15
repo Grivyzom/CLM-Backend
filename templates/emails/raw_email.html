@@ -1,0 +1,81 @@
+
+
+
+<div style="padding:48px;display:flex;flex-wrap:wrap;gap:28px;justify-content:center">
+  <sc-for list="{{ allTiers }}" as="t" hint-placeholder-count="5">
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div style="font:600 11px/1 'JetBrains Mono',monospace;letter-spacing:.08em;color:#8a8478;text-transform:uppercase;text-align:center">{{ t.tierConfig.label }}</div>
+      <div style="width:460px;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.4)">
+        <div style="background:#17140f;width:460px;height:560px;box-sizing:border-box;display:flex;flex-direction:column;font-family:'Space Grotesk',sans-serif;position:relative;overflow:hidden">
+
+          <div style="height:2px;background:{{ t.tierConfig.frameGradient }}"></div>
+
+          <div style="padding:20px 28px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(255,255,255,.07)">
+            <div style="display:flex;align-items:center;gap:11px">
+              <div style="width:28px;height:28px;border-radius:7px;background:#221f18;border:1px solid rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;font:700 13px 'JetBrains Mono',monospace;color:#f2ede2;box-shadow:inset 0 1px 0 rgba(255,255,255,.06)">G</div>
+              <div>
+                <div style="font:700 13.5px/1.1 'Space Grotesk',sans-serif;letter-spacing:.01em;color:#f2ede2">Grivyzom</div>
+                <div style="font:500 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.16em;color:#7d7869;text-transform:uppercase;margin-top:3px">S.P.A</div>
+              </div>
+            </div>
+            <div style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.14em;color:#948d7b;text-transform:uppercase;padding:6px 10px;border:1px solid rgba(255,255,255,.1);border-radius:6px;background:rgba(255,255,255,.02)">KYO‑CLM</div>
+          </div>
+
+          <div style="padding:26px 28px 0;background:radial-gradient(420px 180px at 18% -20%, {{ t.tierConfig.tagBg }}, transparent 70%)">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="width:14px;height:1px;background:{{ t.tierConfig.dot }}"></span>
+              <span style="font:600 9.5px/1 'JetBrains Mono',monospace;letter-spacing:.18em;color:#948d7b;text-transform:uppercase">Bienvenida de cliente</span>
+            </div>
+            <h1 style="margin:12px 0 0;font:700 27px/1.15 'Space Grotesk',sans-serif;letter-spacing:-.015em;color:#f5f1e6">Hola, {{ clientName }}</h1>
+
+            <div style="margin-top:12px;display:flex;align-items:center;gap:9px;height:22px">
+              <span style="display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:6px;background:{{ t.tierConfig.tagBg }};border:1px solid {{ t.tierConfig.tagBorder }}">
+                <span style="width:6px;height:6px;border-radius:50%;background:{{ t.tierConfig.dot }};box-shadow:0 0 6px {{ t.tierConfig.dot }}"></span>
+                <span style="font:600 10px/1 'JetBrains Mono',monospace;letter-spacing:.08em;color:{{ t.tierConfig.dotDark }};text-transform:uppercase">Nivel {{ t.tierConfig.label }}</span>
+              </span>
+              <sc-if value="{{ t.tierConfig.sub }}">
+                <span style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.14em;color:#948d7b;text-transform:uppercase">{{ t.tierConfig.sub }}</span>
+              </sc-if>
+            </div>
+
+            <p style="margin:16px 0 0;font:400 13px/1.6 'Space Grotesk',sans-serif;color:#a8a191;max-width:360px">{{ t.tierConfig.introShort }}</p>
+          </div>
+
+          <div style="margin:20px 28px 0;display:grid;grid-template-columns:1fr 1fr;gap:9px">
+            <div style="background:#1d1a13;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:12px 14px">
+              <div style="font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#7d7869;text-transform:uppercase">ID Cliente</div>
+              <div style="margin-top:7px;font:600 13px/1 'JetBrains Mono',monospace;color:#f2ede2">{{ clienteId }}</div>
+            </div>
+            <div style="background:#1d1a13;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:12px 14px">
+              <div style="font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#7d7869;text-transform:uppercase">Nivel</div>
+              <div style="margin-top:7px;font:600 13px/1 'JetBrains Mono',monospace;color:{{ t.tierConfig.dotDark }}">{{ t.tierConfig.label }}</div>
+            </div>
+            <div style="background:#1d1a13;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:12px 14px">
+              <div style="font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#7d7869;text-transform:uppercase">Registro</div>
+              <div style="margin-top:7px;font:600 13px/1 'JetBrains Mono',monospace;color:#f2ede2">{{ fechaRegistro }}</div>
+            </div>
+            <div style="background:#1d1a13;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:12px 14px">
+              <div style="font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#7d7869;text-transform:uppercase">Registrado por</div>
+              <div style="margin-top:7px;font:600 12px/1.2 'JetBrains Mono',monospace;color:#f2ede2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ registradoPorCorto }}</div>
+            </div>
+          </div>
+
+          <div style="padding:22px 28px 0">
+            <a href="#" style="display:block;text-align:center;padding:13px;background:#4c7df5;color:#0b1120;font:700 13px/1 'Space Grotesk',sans-serif;letter-spacing:.01em;text-decoration:none;border-radius:8px;box-shadow:0 1px 0 rgba(255,255,255,.18) inset, 0 8px 20px rgba(76,125,245,.22)" style-hover="background:#5d8bff">Activar mi cuenta</a>
+            <div style="margin-top:9px;display:flex;justify-content:space-between;align-items:center">
+              <span style="font:400 10px/1 'JetBrains Mono',monospace;color:#6d6759">Crea tu usuario y contraseña</span>
+              <a href="#" style="font:600 10.5px/1 'JetBrains Mono',monospace;color:#4c7df5;text-decoration:none" style-hover="text-decoration:underline">Ver beneficios →</a>
+            </div>
+          </div>
+
+          <div style="margin-top:auto;padding:14px 28px 18px;border-top:1px solid rgba(255,255,255,.06);display:flex;justify-content:space-between;align-items:center">
+            <span style="font:400 9.5px/1.5 'Space Grotesk',sans-serif;color:#7d7869"><a href="mailto:soporte@grivyzom.com" style="color:#a8a191;font-weight:600;text-decoration:none">soporte@grivyzom.com</a> · +56 2 2345 6789</span>
+            <span style="font:400 9px/1 'JetBrains Mono',monospace;color:#4a463b">© 2026 KYO‑CLM</span>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </sc-for>
+</div>
+

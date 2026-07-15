@@ -10,6 +10,9 @@ from rest_framework.exceptions import ValidationError
 from .models import PersonaJuridica, PersonaNatural, Cliente, ContactoRepresentante
 from .serializers import PersonaJuridicaSerializer, PersonaNaturalSerializer
 from contratos.models import Contrato
+from .utils import enviar_correo_bienvenida
+from tenants.permissions import DeleteRequiresTenantAdmin, EditRequiresPermiso, IsPlatformClienteAccess, IsTenantMember, RequiresFeature
+from tenants.scoping import enforce_quota, resolve_tenant_for_write, scoped
 
 
 # ─── Helper: calcular estado de cliente ───────────────────────────────────────
@@ -46,12 +49,53 @@ def _get_contratos_activos(cliente_id):
     ]
 
 
-def get_filtered_clientes_unified(query_params):
+def _resolve_cliente_scoped(request, pk):
+    """Resuelve un cliente (jurídica o natural) dentro del alcance del usuario.
+    Devuelve (obj, tipo) o (None, None) si no existe o está fuera de alcance."""
+    try:
+        obj = scoped(PersonaJuridica.objects.all(), request, cliente_field='pk').get(pk=pk)
+        return obj, 'juridica'
+    except PersonaJuridica.DoesNotExist:
+        pass
+    try:
+        obj = scoped(PersonaNatural.objects.all(), request, cliente_field='pk').get(pk=pk)
+        return obj, 'natural'
+    except PersonaNatural.DoesNotExist:
+        return None, None
+
+
+def _serialize_cliente_detail(obj, tipo, pk):
+    """Payload de detalle de cliente compartido por ClienteDetailView y el
+    workspace: serializer según tipo + estado calculado + contactos + contratos
+    activos."""
+    contratos_count = Contrato.objects.filter(cliente_id=pk).count()
+    statuses = set(Contrato.objects.filter(cliente_id=pk).values_list('status', flat=True))
+    estado = _compute_estado(obj.is_active, pk, {pk: statuses})
+
+    if tipo == 'juridica':
+        contactos = list(ContactoRepresentante.objects.filter(cliente_juridico_id=pk))
+        contacto_data = {'nombre': contactos[0].nombre, 'telefono': contactos[0].telefono or '', 'cargo': contactos[0].cargo, 'email': contactos[0].email} if contactos else None
+        extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': contacto_data}}
+        data = PersonaJuridicaSerializer(obj, context={'extra': extra_ctx}).data
+        data['contactos'] = [{'nombre': c.nombre, 'cargo': c.cargo, 'email': c.email, 'telefono': c.telefono or ''} for c in contactos]
+    else:
+        extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': None}}
+        data = PersonaNaturalSerializer(obj, context={'extra': extra_ctx}).data
+
+    data['estado'] = estado
+    data['contratos_count'] = contratos_count
+    data['contratos_activos'] = _get_contratos_activos(pk)
+    return data
+
+
+def get_filtered_clientes_unified(query_params, request=None):
     """
     Aplica los filtros (search, estado, tipo, fecha_desde, fecha_hasta) leídos de
     query_params (dict-like: QueryDict de Django o request.query_params de DRF) y
     devuelve la lista unificada de clientes (PersonaJuridica + PersonaNatural)
     ordenada por fecha_registro desc, SIN paginar.
+
+    Si se pasa request, el resultado queda acotado al tenant del usuario.
 
     Reutilizado por ClienteListView.get (paginación) y por las vistas de exportación
     de documentos (que necesitan el mismo conjunto filtrado completo).
@@ -65,9 +109,12 @@ def get_filtered_clientes_unified(query_params):
     fecha_hasta = query_params.get('fecha_hasta', None)
     ordering    = query_params.get('ordering', '').strip()
 
-    # ── Querysets base ───────────────────────────────────────────────────
+    # ── Querysets base (acotados al tenant del solicitante) ──────────────
     pj_qs = PersonaJuridica.objects.all()
     pn_qs = PersonaNatural.objects.all()
+    if request is not None:
+        pj_qs = scoped(pj_qs, request, cliente_field='pk')
+        pn_qs = scoped(pn_qs, request, cliente_field='pk')
 
     # Filtro de fechas (fecha_registro en la tabla base Cliente)
     if fecha_desde:
@@ -216,7 +263,7 @@ class ClienteListView(APIView):
       - page        : número de página (default 1)
       - page_size   : registros por página (default 20, máx 100)
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
 
     def post(self, request):
         """Crea PersonaNatural o PersonaJuridica."""
@@ -224,9 +271,36 @@ class ClienteListView(APIView):
         if tipo not in ('natural', 'juridica'):
             return Response({'error': 'tipo debe ser "natural" o "juridica"'}, status=status.HTTP_400_BAD_REQUEST)
 
+        tenant_name = request.data.get('nombre_completo', '').strip() if tipo == 'natural' else request.data.get('razon_social', '').strip()
+        if not tenant_name:
+            return Response({'error': 'Nombre o razón social es requerido'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # El Cliente siempre se crea dentro del tenant del usuario autenticado
+        # (resolve_tenant_for_write ignora cualquier tenant_id del payload para
+        # usuarios de tenant). Antes esto hacía Tenant.objects.get_or_create()
+        # por razon_social, lo que permitía a un usuario de un tenant recuperar
+        # y mutar (categoria/estado) el Tenant de otra empresa si adivinaba su
+        # razón social — nunca se debe crear ni modificar un Tenant desde acá.
+        try:
+            tenant = resolve_tenant_for_write(request, request.data)
+        except ValidationError as e:
+            return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+        # Enforce quota for the tenant (even if just created, it might have defaults)
+        enforce_quota(tenant, 'clientes')
+        # Unicidad por tenant de RUN/RUT: la DB no puede imponerla (el tenant
+        # vive en la tabla padre del multi-table inheritance), se valida aquí.
+        run = request.data.get('run', '').strip()
+        rut = request.data.get('rut', '').strip()
+        if tipo == 'natural' and run and PersonaNatural.objects.filter(tenant=tenant, run=run).exists():
+            return Response({'error': 'RUN ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
+        if tipo == 'juridica' and rut and PersonaJuridica.objects.filter(tenant=tenant, rut=rut).exists():
+            return Response({'error': 'RUT ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             if tipo == 'natural':
                 cliente = PersonaNatural.objects.create(
+                    tenant=tenant,
                     email_principal=request.data.get('email_principal', '').strip(),
                     telefono_contacto=request.data.get('telefono_contacto', '').strip() or None,
                     run=request.data.get('run', '').strip(),
@@ -236,6 +310,7 @@ class ClienteListView(APIView):
                 data = PersonaNaturalSerializer(cliente, context={'extra': extra_ctx}).data
             else:  # juridica
                 cliente = PersonaJuridica.objects.create(
+                    tenant=tenant,
                     email_principal=request.data.get('email_principal', '').strip(),
                     telefono_contacto=request.data.get('telefono_contacto', '').strip() or None,
                     rut=request.data.get('rut', '').strip(),
@@ -255,10 +330,13 @@ class ClienteListView(APIView):
                 extra_ctx = {cliente.id: {'contratos_count': 0, 'contacto': None}}
                 data = PersonaJuridicaSerializer(cliente, context={'extra': extra_ctx}).data
 
+            # Enviar correo de bienvenida
+            enviar_correo_bienvenida(cliente)
+
             return Response(data, status=status.HTTP_201_CREATED)
         except IntegrityError as e:
             error_msg = str(e)
-            if 'email_principal' in error_msg:
+            if 'email' in error_msg:  # cubre la constraint uniq_cliente_email_por_tenant
                 return Response({'error': 'Email ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
             elif 'run' in error_msg:
                 return Response({'error': 'RUN ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
@@ -278,7 +356,7 @@ class ClienteListView(APIView):
         offset = (page - 1) * page_size
 
         # Lista unificada (todos los clientes que matchean search/estado/tipo/fechas, sin paginar)
-        unified = get_filtered_clientes_unified(request.query_params)
+        unified = get_filtered_clientes_unified(request.query_params, request)
 
         # ── Totales para stats ───────────────────────────────────────────────
         total_all   = len(unified)
@@ -351,48 +429,21 @@ class ClienteDetailView(APIView):
     DELETE /api/clientes/<id>/
     Elimina un cliente (PersonaJuridica o PersonaNatural).
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [
+        (IsTenantMember & RequiresFeature('clientes') & DeleteRequiresTenantAdmin & EditRequiresPermiso('clientes'))
+        | IsPlatformClienteAccess
+    ]
 
     def get(self, request, pk):
-        # Buscar en PersonaJuridica
-        try:
-            obj = PersonaJuridica.objects.get(pk=pk)
-            contratos_count = Contrato.objects.filter(cliente_id=pk).count()
-            statuses = set(Contrato.objects.filter(cliente_id=pk).values_list('status', flat=True))
-            estado = _compute_estado(obj.is_active, pk, {pk: statuses})
-            contactos = list(ContactoRepresentante.objects.filter(cliente_juridico_id=pk))
-            contacto_data = {'nombre': contactos[0].nombre, 'telefono': contactos[0].telefono or '', 'cargo': contactos[0].cargo, 'email': contactos[0].email} if contactos else None
-            extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': contacto_data}}
-            data = PersonaJuridicaSerializer(obj, context={'extra': extra_ctx}).data
-            data['estado'] = estado
-            data['contratos_count'] = contratos_count
-            data['contactos'] = [{'nombre': c.nombre, 'cargo': c.cargo, 'email': c.email, 'telefono': c.telefono or ''} for c in contactos]
-            data['contratos_activos'] = _get_contratos_activos(pk)
-            return Response(data)
-        except PersonaJuridica.DoesNotExist:
-            pass
-
-        # Buscar en PersonaNatural
-        try:
-            obj = PersonaNatural.objects.get(pk=pk)
-            contratos_count = Contrato.objects.filter(cliente_id=pk).count()
-            statuses = set(Contrato.objects.filter(cliente_id=pk).values_list('status', flat=True))
-            estado = _compute_estado(obj.is_active, pk, {pk: statuses})
-            extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': None}}
-            data = PersonaNaturalSerializer(obj, context={'extra': extra_ctx}).data
-            data['estado'] = estado
-            data['contratos_count'] = contratos_count
-            data['contratos_activos'] = _get_contratos_activos(pk)
-            return Response(data)
-        except PersonaNatural.DoesNotExist:
-            pass
-
-        return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+        obj, tipo = _resolve_cliente_scoped(request, pk)
+        if obj is None:
+            return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(_serialize_cliente_detail(obj, tipo, pk))
 
     def patch(self, request, pk):
         # Buscar en PersonaJuridica
         try:
-            obj = PersonaJuridica.objects.get(pk=pk)
+            obj = scoped(PersonaJuridica.objects.all(), request, cliente_field='pk').get(pk=pk)
 
             # Actualizar campos
             if 'is_active' in request.data:
@@ -424,7 +475,7 @@ class ClienteDetailView(APIView):
             pass
         except IntegrityError as e:
             error_msg = str(e)
-            if 'email_principal' in error_msg:
+            if 'email' in error_msg:  # cubre la constraint uniq_cliente_email_por_tenant
                 return Response({'error': 'Email ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
             elif 'rut' in error_msg:
                 return Response({'error': 'RUT ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
@@ -432,7 +483,7 @@ class ClienteDetailView(APIView):
 
         # Buscar en PersonaNatural
         try:
-            obj = PersonaNatural.objects.get(pk=pk)
+            obj = scoped(PersonaNatural.objects.all(), request, cliente_field='pk').get(pk=pk)
 
             # Actualizar campos
             if 'is_active' in request.data:
@@ -460,7 +511,7 @@ class ClienteDetailView(APIView):
             pass
         except IntegrityError as e:
             error_msg = str(e)
-            if 'email_principal' in error_msg:
+            if 'email' in error_msg:  # cubre la constraint uniq_cliente_email_por_tenant
                 return Response({'error': 'Email ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
             elif 'run' in error_msg:
                 return Response({'error': 'RUN ya está registrado'}, status=status.HTTP_400_BAD_REQUEST)
@@ -475,7 +526,7 @@ class ClienteDetailView(APIView):
 
         # Buscar en PersonaJuridica
         try:
-            obj = PersonaJuridica.objects.get(pk=pk)
+            obj = scoped(PersonaJuridica.objects.all(), request, cliente_field='pk').get(pk=pk)
             obj.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
         except PersonaJuridica.DoesNotExist:
@@ -485,7 +536,7 @@ class ClienteDetailView(APIView):
 
         # Buscar en PersonaNatural
         try:
-            obj = PersonaNatural.objects.get(pk=pk)
+            obj = scoped(PersonaNatural.objects.all(), request, cliente_field='pk').get(pk=pk)
             obj.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
         except PersonaNatural.DoesNotExist:
@@ -501,21 +552,23 @@ class ClienteStatsView(APIView):
     GET /api/clientes/stats/
     Devuelve solo las estadísticas globales de forma liviana.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
 
     def get(self, request):
-        total = Cliente.objects.count()
-        activos = Cliente.objects.filter(is_active=True).count()
-        inactivos = Cliente.objects.filter(is_active=False).count()
+        clientes_qs = scoped(Cliente.objects.all(), request, cliente_field='pk')
+        contratos_qs = scoped(Contrato.objects.all(), request, cliente_field='cliente_id')
+        total = clientes_qs.count()
+        activos = clientes_qs.filter(is_active=True).count()
+        inactivos = clientes_qs.filter(is_active=False).count()
         # "En revisión" = activos con contratos en MORA/GRACIA pero sin ACTIVO
         mora_ids = set(
-            Contrato.objects
+            contratos_qs
             .filter(status__in=['MORA', 'GRACIA'])
             .values_list('cliente_id', flat=True)
             .distinct()
         )
         activo_ids = set(
-            Contrato.objects
+            contratos_qs
             .filter(status='ACTIVO')
             .values_list('cliente_id', flat=True)
             .distinct()
@@ -528,3 +581,301 @@ class ClienteStatsView(APIView):
             'en_revision': en_revision,
             'inactivos': inactivos,
         })
+
+
+# ─── Workspace de cliente ─────────────────────────────────────────────────────
+
+def _es_usuario_cliente(request):
+    from tenants.models import RolTenant
+    return (request.user.tenant_id is not None
+            and getattr(request.user, 'role', None) == RolTenant.CLIENTE)
+
+
+class ClienteWorkspaceView(APIView):
+    """
+    GET /api/clientes/<id>/workspace/
+    Payload agregado para la vista workspace: perfil completo, contratos,
+    incidencias recientes, usuarios-cuenta vinculados (solo staff/tenant),
+    membresía (plan del tenant) y feed de actividad.
+    """
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
+
+    def get(self, request, pk):
+        from django.contrib.auth import get_user_model
+        from tenants.plans import plan_payload
+        from notificaciones.models import Notificacion
+        from .models import CorreoEnviado
+
+        obj, tipo = _resolve_cliente_scoped(request, pk)
+        if obj is None:
+            return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        perfil = _serialize_cliente_detail(obj, tipo, pk)
+
+        contratos = [
+            {
+                'id': c.id,
+                'software': c.software.nombre,
+                'categoria_producto': c.software.categoria,
+                'tipo_contrato': c.tipo_contrato,
+                'etapa': c.etapa,
+                'status': c.status,
+                'monto': str(c.monto),
+                'frecuencia_facturacion': c.frecuencia_facturacion,
+                'fecha_inicio': c.fecha_inicio,
+                'fecha_vencimiento': c.fecha_vencimiento,
+                'fin_periodo_gracia': c.fin_periodo_gracia,
+            }
+            for c in Contrato.objects.filter(cliente_id=pk).select_related('software').order_by('-fecha_inicio')
+        ]
+
+        incidencias = [
+            {
+                'id': i.id,
+                'titulo': i.titulo,
+                'severidad': i.severidad,
+                'estado': i.estado,
+                'fecha_creacion': i.fecha_creacion,
+            }
+            for i in obj.incidencias.order_by('-fecha_creacion')[:10]
+        ]
+
+        data = {
+            'perfil': perfil,
+            'tipo': tipo,
+            'contratos': contratos,
+            'incidencias': incidencias,
+            'membresia': {
+                **plan_payload(obj.tenant),
+                'tenant': {
+                    'razon_social': obj.tenant.razon_social,
+                    'estado': obj.tenant.estado,
+                    'categoria': obj.tenant.categoria,
+                },
+            },
+        }
+
+        # Los usuarios-cuenta son información de gestión: un usuario-cliente
+        # no debe ver las cuentas de acceso de su propia empresa.
+        if not _es_usuario_cliente(request):
+            User = get_user_model()
+            data['usuarios_cuenta'] = [
+                {
+                    'id': u.id,
+                    'username': u.username,
+                    'email': u.email,
+                    'last_login': u.last_login,
+                    'is_active': u.is_active,
+                }
+                for u in User.objects.filter(cliente_id=pk).order_by('username')
+            ]
+
+        # Feed de actividad: fusión de eventos recientes de distintas fuentes.
+        actividad = [
+            {'tipo': 'REGISTRO', 'fecha': obj.fecha_registro, 'detalle': 'Cliente registrado'},
+        ]
+        if obj.fecha_modificacion and obj.fecha_modificacion != obj.fecha_registro:
+            actividad.append({'tipo': 'MODIFICACION', 'fecha': obj.fecha_modificacion, 'detalle': 'Ficha modificada'})
+        for correo in CorreoEnviado.objects.filter(cliente_id=pk)[:5]:
+            actividad.append({
+                'tipo': 'CORREO', 'fecha': correo.fecha_envio,
+                'detalle': f"Correo {'enviado' if correo.estado == 'ENVIADO' else 'fallido'}: {correo.asunto}",
+            })
+        for notif in Notificacion.objects.filter(cliente_id=pk)[:5]:
+            actividad.append({
+                'tipo': 'NOTIFICACION', 'fecha': notif.fecha_creacion,
+                'detalle': f"Notificación [{notif.tipo}]: {notif.titulo}",
+            })
+        from contratos.models import HistorialEtapaContrato
+        for h in HistorialEtapaContrato.objects.filter(contrato__cliente_id=pk).select_related('contrato')[:5]:
+            actividad.append({
+                'tipo': 'ETAPA_CONTRATO', 'fecha': h.fecha_cambio,
+                'detalle': f"Contrato #{h.contrato_id}: {h.etapa_anterior or '—'} → {h.etapa_nueva}",
+            })
+        for i in obj.incidencias.order_by('-fecha_creacion')[:5]:
+            actividad.append({
+                'tipo': 'INCIDENCIA', 'fecha': i.fecha_creacion,
+                'detalle': f"Incidencia #{i.id}: {i.titulo}",
+            })
+        actividad.sort(key=lambda e: e['fecha'], reverse=True)
+        data['actividad'] = actividad[:20]
+
+        return Response(data)
+
+
+class ClienteTimelinePagosView(APIView):
+    """
+    GET /api/clientes/<id>/timeline-pagos/
+    Timeline derivado de facturación (solo lectura): no hay modelo Pago, los
+    eventos se construyen desde los contratos (inicio, vencimientos de cuota
+    según frecuencia, cambios de etapa, gracia) y los perdonazos.
+    """
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
+
+    def get(self, request, pk):
+        from datetime import date
+        from dateutil.relativedelta import relativedelta
+        from contratos.models import HistorialEtapaContrato, RegistroPerdonazo
+
+        obj, tipo = _resolve_cliente_scoped(request, pk)
+        if obj is None:
+            return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        hoy = date.today()
+        eventos = []
+
+        def _push(tipo_ev, fecha, contrato, detalle, monto=None):
+            # fecha puede ser date o datetime; se normaliza para ordenar.
+            fecha_orden = fecha.date() if hasattr(fecha, 'date') else fecha
+            eventos.append({
+                'tipo': tipo_ev,
+                'fecha': fecha,
+                '_orden': fecha_orden,
+                'contrato_id': contrato.id,
+                'contrato_nombre': contrato.software.nombre,
+                'monto': str(monto) if monto is not None else None,
+                'detalle': detalle,
+            })
+
+        contratos = list(Contrato.objects.filter(cliente_id=pk).select_related('software'))
+        en_mora = 0
+        proximo_vencimiento = None
+
+        for c in contratos:
+            _push('INICIO_CONTRATO', c.fecha_inicio, c, 'Inicio del contrato', c.monto)
+
+            # Serie de vencimientos de cuota para contratos recurrentes
+            if c.frecuencia_facturacion in ('MENSUAL', 'ANUAL'):
+                paso = relativedelta(months=1) if c.frecuencia_facturacion == 'MENSUAL' else relativedelta(years=1)
+                limite = min(hoy, c.fecha_vencimiento) if c.fecha_vencimiento else hoy
+                cuota = c.fecha_inicio + paso
+                n = 0
+                while cuota <= limite and n < 120:  # tope defensivo: 10 años de cuotas mensuales
+                    _push('VENCIMIENTO_CUOTA', cuota, c,
+                          f"Cuota {c.get_frecuencia_facturacion_display().lower()}", c.monto)
+                    cuota += paso
+                    n += 1
+                # Próxima cuota futura del cliente (para el resumen)
+                if c.status not in ('VENCIDO', 'SUSPENDIDO') and (c.fecha_vencimiento is None or cuota <= c.fecha_vencimiento):
+                    if proximo_vencimiento is None or cuota < proximo_vencimiento:
+                        proximo_vencimiento = cuota
+
+            if c.fecha_vencimiento and c.fecha_vencimiento <= hoy:
+                _push('VENCIMIENTO_CONTRATO', c.fecha_vencimiento, c, 'Fin de vigencia del contrato')
+
+            if c.status in ('MORA', 'GRACIA', 'SUSPENDIDO'):
+                en_mora += 1
+                detalle = f"Contrato en {c.get_status_display().lower()}"
+                if c.status == 'GRACIA' and c.fin_periodo_gracia:
+                    detalle += f" (gracia hasta {c.fin_periodo_gracia.strftime('%d/%m/%Y')})"
+                _push('ESTADO_COBRANZA', c.fin_periodo_gracia or hoy, c, detalle)
+
+        for h in HistorialEtapaContrato.objects.filter(contrato__cliente_id=pk).select_related('contrato__software'):
+            _push('CAMBIO_ETAPA', h.fecha_cambio, h.contrato,
+                  f"Etapa: {h.etapa_anterior or '—'} → {h.etapa_nueva}")
+
+        for p in RegistroPerdonazo.objects.filter(contrato__cliente_id=pk).select_related('contrato__software'):
+            _push('PERDONAZO', p.fecha_concesion, p.contrato,
+                  f"Perdonazo: +{p.dias_extendidos} días (vencía {p.fecha_vencimiento_anterior.strftime('%d/%m/%Y')}). {p.motivo}")
+
+        eventos.sort(key=lambda e: e['_orden'], reverse=True)
+        for e in eventos:
+            del e['_orden']
+
+        return Response({
+            'eventos': eventos,
+            'resumen': {
+                'total_contratos': len(contratos),
+                'en_mora': en_mora,
+                'proximo_vencimiento': proximo_vencimiento,
+            },
+        })
+
+
+class ClienteCorreosView(APIView):
+    """
+    GET  /api/clientes/<id>/correos/        → historial de correos (últimos 50)
+    POST /api/clientes/<id>/enviar-correo/  → envía correo y registra intento
+    (el POST vive en ClienteEnviarCorreoView; esta clase solo lista).
+    """
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
+
+    def get(self, request, pk):
+        from .models import CorreoEnviado
+
+        obj, tipo = _resolve_cliente_scoped(request, pk)
+        if obj is None:
+            return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        correos = [
+            {
+                'id': c.id,
+                'destinatario': c.destinatario,
+                'asunto': c.asunto,
+                'cuerpo': c.cuerpo,
+                'estado': c.estado,
+                'error': c.error,
+                'enviado_por': c.enviado_por.username if c.enviado_por else None,
+                'fecha_envio': c.fecha_envio,
+            }
+            for c in CorreoEnviado.objects.filter(cliente_id=pk).select_related('enviado_por')[:50]
+        ]
+        return Response({'results': correos})
+
+
+class ClienteEnviarCorreoView(APIView):
+    """
+    POST /api/clientes/<id>/enviar-correo/
+    Body: {asunto, cuerpo, destinatario?} — destinatario default email_principal.
+    Registra el intento en CorreoEnviado aunque el envío falle.
+    """
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
+
+    def post(self, request, pk):
+        from .models import CorreoEnviado, EstadoCorreo
+        from .utils import enviar_correo_cliente
+
+        # IsTenantMember no distingue al rol CLIENTE en escrituras: un
+        # usuario-cliente no puede enviarse correos desde el workspace.
+        if _es_usuario_cliente(request):
+            return Response({'error': 'No tienes permiso para enviar correos.'},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        obj, tipo = _resolve_cliente_scoped(request, pk)
+        if obj is None:
+            return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        asunto = (request.data.get('asunto') or '').strip()
+        cuerpo = (request.data.get('cuerpo') or '').strip()
+        destinatario = (request.data.get('destinatario') or '').strip() or obj.email_principal
+        if not asunto or not cuerpo:
+            return Response({'error': 'Asunto y cuerpo son requeridos'}, status=status.HTTP_400_BAD_REQUEST)
+
+        registro = CorreoEnviado(
+            tenant=obj.tenant,
+            cliente_id=pk,
+            destinatario=destinatario,
+            asunto=asunto,
+            cuerpo=cuerpo,
+            enviado_por=request.user,
+        )
+        try:
+            enviar_correo_cliente(obj, asunto, cuerpo, destinatario)
+            registro.estado = EstadoCorreo.ENVIADO
+            registro.save()
+        except Exception as e:
+            registro.estado = EstadoCorreo.FALLIDO
+            registro.error = str(e)
+            registro.save()
+            return Response({
+                'error': f'No se pudo enviar el correo: {e}',
+                'registro_id': registro.id,
+            }, status=status.HTTP_502_BAD_GATEWAY)
+
+        return Response({
+            'id': registro.id,
+            'destinatario': destinatario,
+            'asunto': asunto,
+            'estado': registro.estado,
+            'fecha_envio': registro.fecha_envio,
+        }, status=status.HTTP_201_CREATED)

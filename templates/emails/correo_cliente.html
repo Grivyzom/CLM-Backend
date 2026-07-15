@@ -1,0 +1,58 @@
+<!-- Correo genérico al cliente enviado desde el workspace.
+     Marco visual derivado de raw_email.html (card oscura Grivyzom / KYO-CLM),
+     adaptado a sintaxis Django real. Los estilos van inline y con hex porque
+     es HTML de email: los clientes de correo no soportan hojas externas ni
+     variables CSS. -->
+<div style="padding:32px 12px;background:#f4f1ea">
+  <div style="max-width:520px;margin:0 auto;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.4)">
+    <div style="background:#17140f;box-sizing:border-box;font-family:'Space Grotesk','Segoe UI',Arial,sans-serif">
+
+      <div style="height:2px;background:linear-gradient(90deg,#4c7df5,#8a63f0)"></div>
+
+      <div style="padding:20px 28px;border-bottom:1px solid rgba(255,255,255,.07)">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td>
+            <table role="presentation" cellpadding="0" cellspacing="0"><tr>
+              <td style="width:28px;height:28px;border-radius:7px;background:#221f18;border:1px solid rgba(255,255,255,.12);text-align:center;font:700 13px 'JetBrains Mono',monospace;color:#f2ede2">G</td>
+              <td style="padding-left:11px">
+                <div style="font:700 13.5px/1.1 'Space Grotesk',sans-serif;color:#f2ede2">Grivyzom</div>
+                <div style="font:500 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.16em;color:#7d7869;text-transform:uppercase;margin-top:3px">S.P.A</div>
+              </td>
+            </tr></table>
+          </td>
+          <td align="right">
+            <span style="font:600 9px/1 'JetBrains Mono',monospace;letter-spacing:.14em;color:#948d7b;text-transform:uppercase;padding:6px 10px;border:1px solid rgba(255,255,255,.1);border-radius:6px;background:rgba(255,255,255,.02)">KYO&#8209;CLM</span>
+          </td>
+        </tr></table>
+      </div>
+
+      <div style="padding:26px 28px 0">
+        <div style="font:600 9.5px/1 'JetBrains Mono',monospace;letter-spacing:.18em;color:#948d7b;text-transform:uppercase">Mensaje para {{ nombre_cliente }}</div>
+        <h1 style="margin:12px 0 0;font:700 22px/1.2 'Space Grotesk',sans-serif;letter-spacing:-.015em;color:#f5f1e6">{{ asunto }}</h1>
+        <p style="margin:16px 0 0;font:400 13px/1.7 'Space Grotesk',sans-serif;color:#a8a191">{{ cuerpo|linebreaksbr }}</p>
+      </div>
+
+      <div style="margin:22px 28px 0">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td style="background:#1d1a13;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:12px 14px">
+            <div style="font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#7d7869;text-transform:uppercase">ID Cliente</div>
+            <div style="margin-top:7px;font:600 13px/1 'JetBrains Mono',monospace;color:#f2ede2">{{ cliente_id }}</div>
+          </td>
+          <td style="width:9px"></td>
+          <td style="background:#1d1a13;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:12px 14px">
+            <div style="font:600 8.5px/1 'JetBrains Mono',monospace;letter-spacing:.12em;color:#7d7869;text-transform:uppercase">Fecha</div>
+            <div style="margin-top:7px;font:600 13px/1 'JetBrains Mono',monospace;color:#f2ede2">{{ fecha }}</div>
+          </td>
+        </tr></table>
+      </div>
+
+      <div style="margin-top:24px;padding:14px 28px 18px;border-top:1px solid rgba(255,255,255,.06)">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td style="font:400 9.5px/1.5 'Space Grotesk',sans-serif;color:#7d7869"><a href="mailto:soporte@grivyzom.com" style="color:#a8a191;font-weight:600;text-decoration:none">soporte@grivyzom.com</a> · +56 2 2345 6789</td>
+          <td align="right" style="font:400 9px/1 'JetBrains Mono',monospace;color:#4a463b">© 2026 KYO&#8209;CLM</td>
+        </tr></table>
+      </div>
+
+    </div>
+  </div>
+</div>

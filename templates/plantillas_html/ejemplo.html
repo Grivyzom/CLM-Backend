@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Contrato {{ tipo_contrato }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; margin: 40px; }
+        h1 { color: #2c3e50; text-align: center; border-bottom: 2px solid #2c3e50; padding-bottom: 10px; }
+        .section { margin-top: 20px; }
+        .footer { margin-top: 50px; text-align: center; font-size: 0.9em; color: #7f8c8d; }
+    </style>
+</head>
+<body>
+    <h1>Contrato de Prestación de Servicios</h1>
+    <div class="section">
+        <p><strong>Fecha:</strong> {% now "d \d\e F \d\e Y" %}</p>
+        <p><strong>Cliente:</strong> {{ cliente.nombre|default:"[Nombre del Cliente]" }}</p>
+        <p><strong>Software:</strong> {{ software.nombre|default:"[Nombre del Software]" }}</p>
+        <p><strong>Monto:</strong> {{ monto|default:"0" }} {{ moneda|default:"USD" }}</p>
+    </div>
+    
+    <div class="section">
+        <h3>Términos y Condiciones</h3>
+        <p>El presente documento establece las condiciones para el servicio de software acordado. Ambas partes aceptan los términos expuestos en este contrato.</p>
+    </div>
+    
+    <div class="footer">
+        <p>Generado automáticamente por CLM</p>
+    </div>
+</body>
+</html>

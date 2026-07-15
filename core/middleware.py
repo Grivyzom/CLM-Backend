@@ -20,6 +20,41 @@ class ThreadLocalContext:
             del _thread_locals.software_id
 
 
+class ClienteBloqueadoMiddleware:
+    """Corta el acceso API de usuarios rol CLIENTE cuyo Cliente fue bloqueado
+    (is_active=False). Solo consulta la DB para ese rol; staff y usuarios de
+    tenant no-CLIENTE pasan sin costo. Las sesiones vivas quedan inertes sin
+    necesidad de invalidarlas."""
+
+    EXEMPT_PATHS = ('/api/auth/logout/',)
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        user = getattr(request, 'user', None)
+        if (
+            request.path.startswith('/api/')
+            and request.path not in self.EXEMPT_PATHS
+            and user is not None
+            and user.is_authenticated
+            and user.tenant_id is not None
+        ):
+            from tenants.models import RolTenant
+            if getattr(user, 'role', None) == RolTenant.CLIENTE:
+                from clientes.models import Cliente
+                bloqueado = (
+                    user.cliente_id is None
+                    or not Cliente.objects.filter(pk=user.cliente_id, is_active=True).exists()
+                )
+                if bloqueado:
+                    return JsonResponse({
+                        'error': 'Tu cuenta de cliente está bloqueada. Contacta a soporte.',
+                        'code': 'CLIENTE_BLOQUEADO',
+                    }, status=403)
+        return self.get_response(request)
+
+
 class SoftwareIsolationMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response

@@ -12,8 +12,9 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.db import transaction
 from docxtpl import DocxTemplate
-from jinja2 import Environment, StrictUndefined
-from jinja2.exceptions import TemplateError, UndefinedError
+from jinja2 import StrictUndefined
+from jinja2.sandbox import SandboxedEnvironment
+from jinja2.exceptions import TemplateError, UndefinedError, SecurityError
 
 class TolerantUndefined(StrictUndefined):
     """
@@ -98,12 +99,59 @@ def construir_docx_desde_clausulas(plantilla=None, contrato=None) -> io.BytesIO:
     
     doc.add_paragraph()
 
+    # ---- TEXTO DE BIENVENIDA / PREÁMBULO ----
+    if contrato:
+        cliente_nombre = str(contrato.cliente)
+        identificador = ""
+        persona_juridica = getattr(contrato.cliente, 'personajuridica', None)
+        persona_natural = getattr(contrato.cliente, 'personanatural', None)
+        if persona_juridica:
+            cliente_nombre = persona_juridica.razon_social
+            identificador = f"RUT {persona_juridica.rut}"
+        elif persona_natural:
+            cliente_nombre = persona_natural.nombre_completo
+            identificador = f"RUT/RUN {persona_natural.run}"
+            
+        fecha_str = contrato.fecha_creacion.strftime('%d/%m/%Y') if contrato.fecha_creacion else '_______'
+        software_str = contrato.software.nombre if contrato.software else 'el servicio'
+        
+        intro_text = (
+            f"El presente documento (en adelante, el \"Contrato\") se celebra con fecha {fecha_str}, "
+            f"entre EL PROVEEDOR, y por la otra parte, {cliente_nombre}{', ' + identificador if identificador else ''} "
+            f"(en adelante, el \"Cliente\").\n\n"
+            f"Ambas partes reconocen contar con la capacidad legal suficiente para obligarse y acuerdan los siguientes términos "
+            f"para la provisión y uso del producto de software {software_str}:"
+        )
+    else:
+        intro_text = (
+            "El presente documento (en adelante, el \"Contrato\") se celebra con fecha ____________, "
+            "entre EL PROVEEDOR, y por la otra parte, ____________ (en adelante, el \"Cliente\").\n\n"
+            "Ambas partes reconocen contar con la capacidad legal suficiente para obligarse y acuerdan los siguientes términos "
+            "para la provisión y uso del producto de software ____________:"
+        )
+
+    for p_text in intro_text.split('\n'):
+        if p_text.strip():
+            p_intro = doc.add_paragraph(p_text.strip())
+            p_intro.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p_intro.paragraph_format.space_after = Pt(12)
+            
+    doc.add_paragraph()
+    # ----------------------------------------
+
     if contrato and contrato.texto_adicional_clausulas:
         for p_text in contrato.texto_adicional_clausulas.split('\n'):
             if p_text.strip():
-                p = doc.add_paragraph(p_text.strip())
-                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                p.paragraph_format.space_after = Pt(6)
+                # Detectar encabezado si empieza con un número seguido de punto y espacio
+                if p_text.strip()[0].isdigit() and '. ' in p_text[:5]:
+                    h = doc.add_heading(p_text.strip(), level=1)
+                    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    if h.runs:
+                        h.runs[0].font.color.rgb = RGBColor(0x1E, 0x40, 0xAF)
+                else:
+                    p = doc.add_paragraph(p_text.strip())
+                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    p.paragraph_format.space_after = Pt(6)
     else:
         if plantilla:
             clausulas = plantilla.clausulas_seleccionadas.filter(activa=True).prefetch_related('versiones')
@@ -124,6 +172,39 @@ def construir_docx_desde_clausulas(plantilla=None, contrato=None) -> io.BytesIO:
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             p.paragraph_format.space_after = Pt(6)
 
+    # ---- TEXTO DE CONCLUSIÓN Y FIRMAS ----
+    doc.add_paragraph()
+    concl_text = (
+        "En señal de conformidad y aceptación de las cláusulas y condiciones estipuladas en el presente Contrato, "
+        "las partes lo firman en dos ejemplares de igual tenor y valor, quedando uno en poder de cada parte."
+    )
+    p_concl = doc.add_paragraph(concl_text)
+    p_concl.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    p_concl.paragraph_format.space_before = Pt(12)
+    p_concl.paragraph_format.space_after = Pt(36)
+
+    table = doc.add_table(rows=1, cols=2)
+    table.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    p1 = table.rows[0].cells[0].paragraphs[0]
+    p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p1.add_run("________________________________\n")
+    p1.add_run("Por EL PROVEEDOR\n\n\n")
+
+    p2 = table.rows[0].cells[1].paragraphs[0]
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p2.add_run("________________________________\n")
+    if contrato:
+        cliente_nombre = str(contrato.cliente)
+        if hasattr(contrato.cliente, 'personajuridica'):
+            cliente_nombre = contrato.cliente.personajuridica.razon_social
+        elif hasattr(contrato.cliente, 'personanatural'):
+            cliente_nombre = contrato.cliente.personanatural.nombre_completo
+        p2.add_run(f"Por EL CLIENTE\n{cliente_nombre}\n")
+    else:
+        p2.add_run("Por EL CLIENTE\n____________\n")
+    # ----------------------------------------
+
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -139,12 +220,17 @@ def renderizar_docx(plantilla: PlantillaDocumento, contexto: dict, contrato=None
         else:
             doc = DocxTemplate(plantilla.archivo_docx.path)
         # TolerantUndefined: permite '____________' pero falla si es otra variable no resuelta.
-        jinja_env = Environment(undefined=TolerantUndefined)
+        # SandboxedEnvironment: el texto de cláusulas y de plantillas .docx subidas no es
+        # confiable (lo escriben usuarios del tenant) y docxtpl lo evalúa como Jinja2 -
+        # el entorno normal permite RCE vía atributos como __class__/__globals__.
+        jinja_env = SandboxedEnvironment(undefined=TolerantUndefined)
         doc.render(contexto, jinja_env=jinja_env)
     except UndefinedError as exc:
         raise VariablesFaltantesError(
             f"La plantilla usa una variable que no existe en los datos del contrato: {exc}"
         ) from exc
+    except SecurityError as exc:
+        raise PlantillaRenderError(f"La plantilla usa una construcción no permitida: {exc}") from exc
     except TemplateError as exc:
         raise PlantillaRenderError(f"Error de sintaxis en la plantilla: {exc}") from exc
 
@@ -154,53 +240,64 @@ def renderizar_docx(plantilla: PlantillaDocumento, contexto: dict, contrato=None
     return buf.read()
 
 
-def convertir_a_pdf(docx_bytes: bytes) -> bytes:
-    """Convierte bytes de un .docx a PDF usando LibreOffice headless.
+def renderizar_html(plantilla: PlantillaDocumento, contexto: dict) -> bytes:
+    """Renderiza el código HTML con el contexto dado."""
+    from django.template.loader import render_to_string
+    try:
+        html_str = render_to_string(plantilla.ruta_plantilla_html, contexto)
+        return html_str.encode('utf-8')
+    except Exception as exc:
+        raise PlantillaRenderError(f"Error al renderizar plantilla HTML '{plantilla.ruta_plantilla_html}': {exc}") from exc
 
-    Cada invocación usa un perfil de usuario (-env:UserInstallation) único y
-    temporal: LibreOffice usa un lock global sobre su perfil, así que si dos
-    conversiones corren en paralelo compartiendo perfil, la segunda cuelga o
-    falla. Esto es crítico bajo varios workers de gunicorn generando
-    documentos al mismo tiempo.
-    """
+
+def convertir_con_libreoffice(entrada_bytes: bytes, ext_origen: str, ext_destino: str, filtro: str = None) -> bytes:
+    """Convierte bytes usando LibreOffice headless."""
     binario = getattr(settings, 'LIBREOFFICE_BINARY', 'soffice')
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        docx_path = Path(tmpdir) / 'entrada.docx'
-        docx_path.write_bytes(docx_bytes)
+        entrada_path = Path(tmpdir) / f'entrada.{ext_origen}'
+        entrada_path.write_bytes(entrada_bytes)
 
         perfil_dir = Path(tmpdir) / f'perfil-{uuid.uuid4().hex}'
 
+        args = [
+            binario, '--headless', '--norestore',
+            f'-env:UserInstallation=file://{perfil_dir}',
+            '--convert-to', filtro if filtro else ext_destino, 
+            '--outdir', tmpdir, str(entrada_path)
+        ]
+
         try:
             resultado = subprocess.run(
-                [
-                    binario, '--headless', '--norestore',
-                    f'-env:UserInstallation=file://{perfil_dir}',
-                    '--convert-to', 'pdf', '--outdir', tmpdir, str(docx_path),
-                ],
-                check=True, timeout=60, capture_output=True,
+                args, check=True, timeout=60, capture_output=True,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise ConversionPDFError(f"Falló la conversión a PDF (LibreOffice): {exc}") from exc
+            raise ConversionPDFError(f"Falló la conversión a {ext_destino} (LibreOffice): {exc}") from exc
 
-        pdf_path = docx_path.with_suffix('.pdf')
-        if not pdf_path.exists():
-            detalle = resultado.stderr.decode(errors='replace') if resultado.stderr else ''
-            raise ConversionPDFError(f"LibreOffice no generó el PDF esperado. {detalle}")
+        salida_path = entrada_path.with_suffix(f'.{ext_destino}')
+        if not salida_path.exists():
+            detalle = resultado.stderr.decode(errors='replace') if getattr(resultado, 'stderr', None) else ''
+            raise ConversionPDFError(f"LibreOffice no generó el {ext_destino} esperado. {detalle}")
 
-        return pdf_path.read_bytes()
+        return salida_path.read_bytes()
 
 
-def resolver_plantilla_activa(tipo_contrato: str, software_id) -> PlantillaDocumento:
-    """Plantilla activa específica del software; si no hay, fallback a la activa global."""
+def convertir_a_pdf(docx_bytes: bytes) -> bytes:
+    """Convierte bytes de un .docx a PDF usando LibreOffice headless."""
+    return convertir_con_libreoffice(docx_bytes, 'docx', 'pdf')
+
+
+def resolver_plantilla_activa(tipo_contrato: str, software_id, tenant) -> PlantillaDocumento:
+    """Plantilla activa del tenant específica del software; si no hay, fallback
+    a la activa global (sin software) del mismo tenant."""
     especifica = PlantillaDocumento.objects.filter(
-        tipo_contrato=tipo_contrato, software_id=software_id, activa=True,
+        tenant=tenant, tipo_contrato=tipo_contrato, software_id=software_id, activa=True,
     ).first()
     if especifica:
         return especifica
 
     global_ = PlantillaDocumento.objects.filter(
-        tipo_contrato=tipo_contrato, software__isnull=True, activa=True,
+        tenant=tenant, tipo_contrato=tipo_contrato, software__isnull=True, activa=True,
     ).first()
     if global_:
         return global_
@@ -217,20 +314,32 @@ def obtener_preview_pdf(plantilla: PlantillaDocumento) -> Path:
     ~1-2 s por conversión y la plantilla no cambia entre requests."""
     from ..models import ModoOrigenPlantilla
     
+    es_html = False
     if plantilla.modo_origen == ModoOrigenPlantilla.CLAUSULAS:
-        docx_bytes = construir_docx_desde_clausulas(plantilla).read()
+        entrada_bytes = construir_docx_desde_clausulas(plantilla).read()
+    elif plantilla.modo_origen == ModoOrigenPlantilla.HTML:
+        from django.template.loader import render_to_string
+        try:
+            html_str = render_to_string(plantilla.ruta_plantilla_html, {})
+            entrada_bytes = html_str.encode('utf-8')
+            es_html = True
+        except Exception as exc:
+            raise ConversionPDFError(f"Error al obtener preview de la plantilla HTML '{plantilla.ruta_plantilla_html}': {exc}")
     else:
         with plantilla.archivo_docx.open('rb') as f:
-            docx_bytes = f.read()
+            entrada_bytes = f.read()
             
-    digest = hashlib.sha256(docx_bytes).hexdigest()[:16]
+    digest = hashlib.sha256(entrada_bytes).hexdigest()[:16]
 
     cache_dir = Path(settings.MEDIA_ROOT) / 'plantillas_previews'
     cache_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = cache_dir / f'plantilla_{plantilla.id}_{digest}.pdf'
 
     if not pdf_path.exists():
-        pdf_bytes = convertir_a_pdf(docx_bytes)
+        if es_html:
+            pdf_bytes = convertir_con_libreoffice(entrada_bytes, 'html', 'pdf')
+        else:
+            pdf_bytes = convertir_a_pdf(entrada_bytes)
         pdf_path.write_bytes(pdf_bytes)
     return pdf_path
 
@@ -240,11 +349,18 @@ def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=No
     renderiza docx, convierte a PDF, calcula hash y crea el DocumentoGenerado
     (write-once — nunca actualiza un registro existente)."""
     if plantilla is None:
-        plantilla = resolver_plantilla_activa(contrato.tipo_contrato, contrato.software_id)
+        plantilla = resolver_plantilla_activa(contrato.tipo_contrato, contrato.software_id, contrato.tenant)
 
     contexto = construir_contexto(contrato)
-    docx_bytes = renderizar_docx(plantilla, contexto, contrato)
-    pdf_bytes = convertir_a_pdf(docx_bytes)
+    
+    if plantilla.modo_origen == ModoOrigenPlantilla.HTML:
+        html_bytes = renderizar_html(plantilla, contexto)
+        docx_bytes = convertir_con_libreoffice(html_bytes, 'html', 'docx', 'docx:MS Word 2007 XML')
+        pdf_bytes = convertir_con_libreoffice(html_bytes, 'html', 'pdf')
+    else:
+        docx_bytes = renderizar_docx(plantilla, contexto, contrato)
+        pdf_bytes = convertir_a_pdf(docx_bytes)
+        
     hash_pdf = hashlib.sha256(pdf_bytes).hexdigest()
 
     # El contexto se serializa para auditoría: valores no-JSON-nativos (Decimal, date)

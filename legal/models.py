@@ -3,6 +3,8 @@ from django.contrib.postgres.indexes import GinIndex
 
 class DocumentoLegal(models.Model):
     id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='documentos_legales')
     tipo = models.CharField(max_length=30)
     version_codigo = models.CharField(max_length=32)
     contenido_html = models.TextField()

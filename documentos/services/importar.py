@@ -70,9 +70,9 @@ def extraer_texto_pptx(archivo):
 
 # ─── INGESTORES (datos → modelos Django) ─────────────────────────────────────
 
-def excel_a_clientes(archivo):
+def excel_a_clientes(archivo, tenant):
     """
-    Ingesta clientes desde Excel.
+    Ingesta clientes desde Excel dentro del tenant indicado.
 
     Soporta el formato de importación original y el formato generado por la exportación.
     Devuelve dict con listas: creados, actualizados, errores.
@@ -129,7 +129,7 @@ def excel_a_clientes(archivo):
                     continue
 
                 try:
-                    c = Cliente.objects.get(email_principal=email)
+                    c = Cliente.objects.get(tenant=tenant, email_principal=email)
                     if not hasattr(c, 'personanatural'):
                         errores.append({"fila": num_fila, "error": "El email ya está registrado como Persona Jurídica"})
                         continue
@@ -142,6 +142,7 @@ def excel_a_clientes(archivo):
                     creado = False
                 except Cliente.DoesNotExist:
                     PersonaNatural.objects.create(
+                        tenant=tenant,
                         email_principal=email,
                         telefono_contacto=telefono,
                         is_active=is_active,
@@ -160,7 +161,7 @@ def excel_a_clientes(archivo):
                     continue
 
                 try:
-                    c = Cliente.objects.get(email_principal=email)
+                    c = Cliente.objects.get(tenant=tenant, email_principal=email)
                     if not hasattr(c, 'personajuridica'):
                         errores.append({"fila": num_fila, "error": "El email ya está registrado como Persona Natural"})
                         continue
@@ -174,6 +175,7 @@ def excel_a_clientes(archivo):
                     creado = False
                 except Cliente.DoesNotExist:
                     PersonaJuridica.objects.create(
+                        tenant=tenant,
                         email_principal=email,
                         telefono_contacto=telefono,
                         is_active=is_active,
@@ -197,9 +199,9 @@ def excel_a_clientes(archivo):
     return {"creados": creados, "actualizados": actualizados, "errores": errores}
 
 
-def excel_a_contratos(archivo):
+def excel_a_contratos(archivo, tenant):
     """
-    Ingesta contratos desde Excel.
+    Ingesta contratos desde Excel dentro del tenant indicado.
 
     Columnas esperadas:
         cliente_email | software_nombre | sla_nombre | tipo_contrato |
@@ -208,7 +210,7 @@ def excel_a_contratos(archivo):
     Devuelve dict con listas: creados, errores.
     """
     from clientes.models import Cliente
-    from catalogo.models import Software
+    from catalogo.models import Producto
     from contratos.models import SLA, Contrato, TipoContrato
 
     df = pd.read_excel(archivo, dtype=str).fillna("")
@@ -219,9 +221,10 @@ def excel_a_contratos(archivo):
     for idx, fila in df.iterrows():
         num_fila = idx + 2
         try:
-            cliente = Cliente.objects.get(email_principal=fila["cliente_email"].strip())
-            software = Software.objects.get(nombre=fila["software_nombre"].strip())
-            sla = SLA.objects.get(nombre=fila["sla_nombre"].strip())
+            cliente = Cliente.objects.get(tenant=tenant, email_principal=fila["cliente_email"].strip())
+            # Contrato.software apunta a catalogo.Producto (no a Software).
+            software = Producto.objects.get(tenant=tenant, nombre=fila["software_nombre"].strip())
+            sla = SLA.objects.get(tenant=tenant, nombre=fila["sla_nombre"].strip())
 
             tipo_raw = fila.get("tipo_contrato", "").strip().upper()
             tipos_validos = {t.value: t for t in TipoContrato}
@@ -236,6 +239,7 @@ def excel_a_contratos(archivo):
             dias_gracia = int(fila.get("dias_gracia", 0) or 0)
 
             contrato = Contrato.objects.create(
+                tenant=tenant,
                 cliente=cliente,
                 software=software,
                 sla=sla,
@@ -249,7 +253,7 @@ def excel_a_contratos(archivo):
 
         except Cliente.DoesNotExist:
             errores.append({"fila": num_fila, "error": f"cliente no encontrado: {fila.get('cliente_email')}"})
-        except Software.DoesNotExist:
+        except Producto.DoesNotExist:
             errores.append({"fila": num_fila, "error": f"software no encontrado: {fila.get('software_nombre')}"})
         except SLA.DoesNotExist:
             errores.append({"fila": num_fila, "error": f"SLA no encontrado: {fila.get('sla_nombre')}"})

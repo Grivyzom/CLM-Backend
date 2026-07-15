@@ -24,6 +24,10 @@ class PersonaJuridicaSerializer(serializers.ModelSerializer):
     contratos_count = serializers.SerializerMethodField()
     contacto_principal = serializers.SerializerMethodField()
     contacto_tel = serializers.SerializerMethodField()
+    tenant_name = serializers.CharField(source='tenant.razon_social', read_only=True)
+    tenant_categoria = serializers.CharField(source='tenant.categoria', read_only=True)
+    tenant_estado = serializers.CharField(source='tenant.estado', read_only=True)
+    personal_count = serializers.SerializerMethodField()
 
     class Meta:
         model = PersonaJuridica
@@ -32,10 +36,16 @@ class PersonaJuridicaSerializer(serializers.ModelSerializer):
             'id_fiscal', 'sector', 'estado',
             'email', 'telefono', 'fecha_registro', 'fecha_modificacion',
             'contratos_count', 'contacto_principal', 'contacto_tel',
+            'tenant_name', 'tenant_categoria', 'tenant_estado', 'personal_count'
         ]
 
     def get_tipo(self, obj):
         return 'juridica'
+
+    def get_personal_count(self, obj):
+        if obj.tenant:
+            return obj.tenant.usuarios.count()
+        return 0
 
     def get_estado(self, obj):
         if not obj.is_active:
@@ -88,6 +98,9 @@ class PersonaNaturalSerializer(serializers.ModelSerializer):
     contratos_count = serializers.SerializerMethodField()
     contacto_principal = serializers.SerializerMethodField()
     contacto_tel = serializers.SerializerMethodField()
+    tenant_name = serializers.CharField(source='tenant.razon_social', read_only=True)
+    tenant_categoria = serializers.CharField(source='tenant.categoria', read_only=True)
+    tenant_estado = serializers.CharField(source='tenant.estado', read_only=True)
 
     class Meta:
         model = PersonaNatural
@@ -96,6 +109,7 @@ class PersonaNaturalSerializer(serializers.ModelSerializer):
             'id_fiscal', 'sector', 'estado',
             'email', 'telefono', 'fecha_registro', 'fecha_modificacion',
             'contratos_count', 'contacto_principal', 'contacto_tel',
+            'tenant_name', 'tenant_categoria', 'tenant_estado'
         ]
 
     def get_tipo(self, obj):

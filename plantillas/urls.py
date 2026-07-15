@@ -5,6 +5,8 @@ urlpatterns = [
     path("plantillas/", views.PlantillaListCreateView.as_view(), name="plantillas_list_create"),
     path("plantillas/<int:pk>/", views.PlantillaDetailView.as_view(), name="plantillas_detail"),
     path("plantillas/<int:pk>/preview-pdf/", views.PlantillaPreviewPDFView.as_view(), name="plantillas_preview_pdf"),
+    path("plantillas/<int:pk>/regenerar-preview/", views.PlantillaRegenerarPreviewView.as_view(), name="plantillas_regenerar_preview"),
+    path("plantillas/html-templates/", views.AvailableHtmlTemplatesView.as_view(), name="plantillas_html_templates"),
 
     path("documentos/", views.DocumentoGeneradoListView.as_view(), name="documentos_generados_list"),
     path("documentos/generar/", views.GenerarDocumentoView.as_view(), name="documentos_generar"),
