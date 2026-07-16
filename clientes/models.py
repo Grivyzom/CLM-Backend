@@ -13,6 +13,9 @@ class Cliente(models.Model):
 
     class Meta:
         db_table = 'clientes_cliente'
+        indexes = [
+            models.Index(fields=['tenant', 'is_active'], name='idx_cliente_tenant_active'),
+        ]
         constraints = [
             # Unicidad por tenant: dos empresas distintas pueden registrar el mismo email.
             models.UniqueConstraint(fields=['tenant', 'email_principal'],

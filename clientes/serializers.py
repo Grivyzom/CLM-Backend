@@ -42,15 +42,13 @@ class PersonaJuridicaSerializer(serializers.ModelSerializer):
     def get_tipo(self, obj):
         return 'juridica'
 
-    def get_personal_count(self, obj):
-        if obj.tenant:
-            return obj.tenant.usuarios.count()
-        return 0
-
     def get_estado(self, obj):
+        item_ctx = self.context.get('extra', {}).get(obj.id, {})
+        if 'estado' in item_ctx:
+            return item_ctx['estado']
+        # Fallback solo para llamadores que no precalculan estado (ej. creación).
         if not obj.is_active:
             return 'Inactivo'
-        # Revisar si tiene contratos activos
         has_active = Contrato.objects.filter(
             cliente_id=obj.id, status='ACTIVO'
         ).exists()
@@ -65,6 +63,13 @@ class PersonaJuridicaSerializer(serializers.ModelSerializer):
 
     def get_contratos_count(self, obj):
         return self._get_from_context(obj, 'contratos_count', 0)
+
+    def get_personal_count(self, obj):
+        if hasattr(obj, '_personal_count'):
+            return obj._personal_count
+        if obj.tenant:
+            return obj.tenant.usuarios.count()
+        return 0
 
     def get_contacto_principal(self, obj):
         contacto = self._get_from_context(obj, 'contacto', None)
@@ -119,6 +124,10 @@ class PersonaNaturalSerializer(serializers.ModelSerializer):
         return 'Persona Natural'
 
     def get_estado(self, obj):
+        item_ctx = self.context.get('extra', {}).get(obj.id, {})
+        if 'estado' in item_ctx:
+            return item_ctx['estado']
+        # Fallback solo para llamadores que no precalculan estado (ej. creación).
         if not obj.is_active:
             return 'Inactivo'
         has_active = Contrato.objects.filter(

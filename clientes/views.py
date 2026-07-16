@@ -75,11 +75,11 @@ def _serialize_cliente_detail(obj, tipo, pk):
     if tipo == 'juridica':
         contactos = list(ContactoRepresentante.objects.filter(cliente_juridico_id=pk))
         contacto_data = {'nombre': contactos[0].nombre, 'telefono': contactos[0].telefono or '', 'cargo': contactos[0].cargo, 'email': contactos[0].email} if contactos else None
-        extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': contacto_data}}
+        extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': contacto_data, 'estado': estado}}
         data = PersonaJuridicaSerializer(obj, context={'extra': extra_ctx}).data
         data['contactos'] = [{'nombre': c.nombre, 'cargo': c.cargo, 'email': c.email, 'telefono': c.telefono or ''} for c in contactos]
     else:
-        extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': None}}
+        extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': None, 'estado': estado}}
         data = PersonaNaturalSerializer(obj, context={'extra': extra_ctx}).data
 
     data['estado'] = estado
@@ -245,6 +245,144 @@ def get_filtered_clientes_unified(query_params, request=None):
     return unified
 
 
+def get_filtered_clientes_light(query_params, request=None):
+    """
+    Misma lógica de filtro/orden/estado que get_filtered_clientes_unified, pero
+    sin hidratar objetos ORM completos: usa .values() (solo las columnas que se
+    necesitan para filtrar/ordenar) en vez de instancias de modelo completas.
+
+    Pensada para listados paginados (ClienteListView), donde de todo el conjunto
+    filtrado solo se sirve una página: cargar fila completa (todas las columnas +
+    overhead de instanciar el modelo) para cada cliente que matchea, cuando el
+    99% se descarta tras ordenar/paginar, es trabajo tirado. Acá se resuelve
+    orden/filtro con dicts livianos y el caller pide los objetos completos solo
+    para los ids de la página (ver ClienteListView.get).
+
+    Cada item: {id, tipo, estado, fecha_registro, contratos_count, _campos privados de orden}
+    """
+    search      = query_params.get('search', '').strip()
+    estado_q    = query_params.get('estado', 'Todos').strip()
+    tipo_q      = query_params.get('tipo', 'Todos').strip()
+    fecha_desde = query_params.get('fecha_desde', None)
+    fecha_hasta = query_params.get('fecha_hasta', None)
+    ordering    = query_params.get('ordering', '').strip()
+
+    pj_qs = PersonaJuridica.objects.all()
+    pn_qs = PersonaNatural.objects.all()
+    if request is not None:
+        pj_qs = scoped(pj_qs, request, cliente_field='pk')
+        pn_qs = scoped(pn_qs, request, cliente_field='pk')
+
+    if fecha_desde:
+        pj_qs = pj_qs.filter(fecha_registro__date__gte=fecha_desde)
+        pn_qs = pn_qs.filter(fecha_registro__date__gte=fecha_desde)
+    if fecha_hasta:
+        pj_qs = pj_qs.filter(fecha_registro__date__lte=fecha_hasta)
+        pn_qs = pn_qs.filter(fecha_registro__date__lte=fecha_hasta)
+
+    include_juridica = tipo_q in ('Todos', 'juridica', 'Enterprise', 'Pyme', 'Startup')
+    include_natural  = tipo_q in ('Todos', 'natural', 'Persona Natural')
+
+    if search:
+        pj_qs = pj_qs.filter(
+            Q(razon_social__icontains=search) |
+            Q(rut__icontains=search) |
+            Q(giro__icontains=search) |
+            Q(email_principal__icontains=search)
+        )
+        pn_qs = pn_qs.filter(
+            Q(nombre_completo__icontains=search) |
+            Q(run__icontains=search) |
+            Q(email_principal__icontains=search)
+        )
+
+    pj_rows = list(pj_qs.values('id', 'fecha_registro', 'is_active', 'razon_social', 'rut', 'giro')) if include_juridica else []
+    pn_rows = list(pn_qs.values('id', 'fecha_registro', 'is_active', 'nombre_completo', 'run')) if include_natural else []
+
+    all_ids = [r['id'] for r in pj_rows] + [r['id'] for r in pn_rows]
+
+    contratos_raw = (
+        Contrato.objects
+        .filter(cliente_id__in=all_ids)
+        .values('cliente_id', 'status')
+        .annotate(cnt=Count('id'))
+    )
+    contrato_status_map = {}
+    contrato_count_map = {}
+    for row in contratos_raw:
+        cid = row['cliente_id']
+        contrato_status_map.setdefault(cid, set()).add(row['status'])
+        contrato_count_map[cid] = contrato_count_map.get(cid, 0) + row['cnt']
+
+    unified = []
+    for r in pj_rows:
+        estado = _compute_estado(r['is_active'], r['id'], contrato_status_map)
+        unified.append({
+            'id': r['id'], 'tipo': 'juridica', 'estado': estado,
+            'fecha_registro': r['fecha_registro'],
+            'contratos_count': contrato_count_map.get(r['id'], 0),
+            '_razon_social': r['razon_social'], '_rut': r['rut'], '_giro': r['giro'],
+        })
+    for r in pn_rows:
+        estado = _compute_estado(r['is_active'], r['id'], contrato_status_map)
+        unified.append({
+            'id': r['id'], 'tipo': 'natural', 'estado': estado,
+            'fecha_registro': r['fecha_registro'],
+            'contratos_count': contrato_count_map.get(r['id'], 0),
+            '_nombre_completo': r['nombre_completo'], '_run': r['run'],
+        })
+
+    if ordering:
+        reverse = ordering.startswith('-')
+        field = ordering.lstrip('-')
+
+        representatives_map = {}
+        if field == 'contacto':
+            pj_ids = [u['id'] for u in unified if u['tipo'] == 'juridica']
+            if pj_ids:
+                for cr in ContactoRepresentante.objects.filter(cliente_juridico_id__in=pj_ids):
+                    if cr.cliente_juridico_id not in representatives_map:
+                        representatives_map[cr.cliente_juridico_id] = cr.nombre
+
+        def get_sort_value(item):
+            if field == 'razon_social':
+                val = item.get('_razon_social') or item.get('_nombre_completo')
+            elif field == 'id_fiscal':
+                val = item.get('_rut') or item.get('_run')
+            elif field == 'sector':
+                val = item.get('_giro') if item['tipo'] == 'juridica' else 'Persona Natural'
+            elif field == 'contacto':
+                if item['tipo'] == 'juridica':
+                    val = representatives_map.get(item['id'], '')
+                else:
+                    val = item.get('_nombre_completo')
+            elif field == 'tipo':
+                val = item['tipo']
+            elif field == 'estado':
+                val = item['estado']
+            elif field == 'contratos':
+                val = item['contratos_count']
+            elif field == 'fecha_registro':
+                val = item['fecha_registro']
+            else:
+                val = item['fecha_registro']
+
+            if isinstance(val, str):
+                return val.lower()
+            if val is None:
+                return ''
+            return val
+
+        unified.sort(key=get_sort_value, reverse=reverse)
+    else:
+        unified.sort(key=lambda x: x['fecha_registro'], reverse=True)
+
+    if estado_q not in ('Todos', '', None):
+        unified = [u for u in unified if u['estado'] == estado_q]
+
+    return unified
+
+
 class ClienteListView(APIView):
     """
     GET /api/clientes/
@@ -355,8 +493,9 @@ class ClienteListView(APIView):
 
         offset = (page - 1) * page_size
 
-        # Lista unificada (todos los clientes que matchean search/estado/tipo/fechas, sin paginar)
-        unified = get_filtered_clientes_unified(request.query_params, request)
+        # Filtro/orden livianos sobre todo el conjunto (solo columnas de sort/filtro,
+        # sin hidratar objetos completos) — ver get_filtered_clientes_light.
+        unified = get_filtered_clientes_light(request.query_params, request)
 
         # ── Totales para stats ───────────────────────────────────────────────
         total_all   = len(unified)
@@ -367,8 +506,27 @@ class ClienteListView(APIView):
         # ── Paginación ────────────────────────────────────────────────────────
         page_items = unified[offset: offset + page_size]
 
+        # Los objetos completos (todas las columnas + tenant) se piden recién acá,
+        # solo para los ids de esta página — antes se hidrataba el conjunto entero.
+        pj_page_ids = [u['id'] for u in page_items if u['tipo'] == 'juridica']
+        pn_page_ids = [u['id'] for u in page_items if u['tipo'] == 'natural']
+
+        pj_objs = {}
+        if pj_page_ids:
+            pj_objs = {
+                o.id: o for o in
+                PersonaJuridica.objects.filter(id__in=pj_page_ids)
+                    .select_related('tenant')
+                    .annotate(_personal_count=Count('tenant__usuarios', distinct=True))
+            }
+        pn_objs = {}
+        if pn_page_ids:
+            pn_objs = {
+                o.id: o for o in
+                PersonaNatural.objects.filter(id__in=pn_page_ids).select_related('tenant')
+            }
+
         # Cargar contactos representantes solo para personasjuridicas en la página
-        pj_page_ids = [u['obj'].id for u in page_items if u['tipo'] == 'juridica']
         contactos_map = {}
         if pj_page_ids:
             for cr in ContactoRepresentante.objects.filter(cliente_juridico_id__in=pj_page_ids):
@@ -383,21 +541,20 @@ class ClienteListView(APIView):
         # ── Serializar ────────────────────────────────────────────────────────
         results = []
         for item in page_items:
-            obj   = item['obj']
-            cid   = obj.id
+            cid = item['id']
             extra_ctx = {cid: {
                 'contratos_count': item['contratos_count'],
                 'contacto': contactos_map.get(cid),
+                'estado': item['estado'],
             }}
 
             if item['tipo'] == 'juridica':
+                obj = pj_objs[cid]
                 data = PersonaJuridicaSerializer(obj, context={'extra': extra_ctx}).data
             else:
+                obj = pn_objs[cid]
                 data = PersonaNaturalSerializer(obj, context={'extra': extra_ctx}).data
 
-            # Override estado calculado (más eficiente que re-calcular en el serializer)
-            data['estado'] = item['estado']
-            data['contratos_count'] = item['contratos_count']
             results.append(data)
 
         return Response({
@@ -466,10 +623,8 @@ class ClienteDetailView(APIView):
             estado = _compute_estado(obj.is_active, pk, {pk: statuses})
             contactos = list(ContactoRepresentante.objects.filter(cliente_juridico_id=pk))
             contacto_data = {'nombre': contactos[0].nombre, 'telefono': contactos[0].telefono or '', 'cargo': contactos[0].cargo, 'email': contactos[0].email} if contactos else None
-            extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': contacto_data}}
+            extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': contacto_data, 'estado': estado}}
             data = PersonaJuridicaSerializer(obj, context={'extra': extra_ctx}).data
-            data['estado'] = estado
-            data['contratos_count'] = contratos_count
             return Response(data, status=status.HTTP_200_OK)
         except PersonaJuridica.DoesNotExist:
             pass
@@ -502,10 +657,8 @@ class ClienteDetailView(APIView):
             contratos_count = Contrato.objects.filter(cliente_id=pk).count()
             statuses = set(Contrato.objects.filter(cliente_id=pk).values_list('status', flat=True))
             estado = _compute_estado(obj.is_active, pk, {pk: statuses})
-            extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': None}}
+            extra_ctx = {pk: {'contratos_count': contratos_count, 'contacto': None, 'estado': estado}}
             data = PersonaNaturalSerializer(obj, context={'extra': extra_ctx}).data
-            data['estado'] = estado
-            data['contratos_count'] = contratos_count
             return Response(data, status=status.HTTP_200_OK)
         except PersonaNatural.DoesNotExist:
             pass
