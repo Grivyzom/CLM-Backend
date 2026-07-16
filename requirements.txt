@@ -13,3 +13,10 @@ pandas==2.3.3
 pdfplumber==0.11.10
 python-pptx==1.0.2
 reportlab==4.4.4
+weasyprint==69.0
+beautifulsoup4==4.12.3
+
+# Storage S3 opcional (ver core/settings.py, USE_S3_STORAGE): descomentar e
+# instalar solo si se activa ese modo. Sin la env var, Django ni las importa.
+# django-storages[s3]==1.14.4
+# boto3==1.34.162

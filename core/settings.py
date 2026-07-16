@@ -122,6 +122,11 @@ DATABASES = {
         'PASSWORD': os.environ.get('DB_PASSWORD', 'tu_password'),
         'HOST': os.environ.get('DB_HOST', 'localhost'),
         'PORT': os.environ.get('DB_PORT', '5432'),
+        # Sin esto, Django abre/cierra una conexión TCP+auth por request.
+        # 60s reutiliza la conexión entre requests (impacto crece con tráfico/tenants);
+        # CONN_HEALTH_CHECKS evita servir una conexión muerta tras ese período.
+        'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', 60)),
+        'CONN_HEALTH_CHECKS': True,
     }
 }
 
@@ -171,10 +176,54 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
+# Storage de archivos (docx/pdf generados, adjuntos, firmas): filesystem local
+# por default (como siempre). USE_S3_STORAGE=true lo cambia a S3 sin tocar
+# código de las apps (todas usan FileField / storage.url(), no rutas de disco
+# a mano) — requiere django-storages + boto3 instalados y las credenciales de
+# abajo. Sin la env var, este bloque no se ejecuta y nada cambia.
+USE_S3_STORAGE = os.environ.get('USE_S3_STORAGE', 'false').lower() == 'true'
+
+if USE_S3_STORAGE:
+    STORAGES = {
+        'default': {
+            'BACKEND': 'storages.backends.s3.S3Storage',
+            'OPTIONS': {
+                'bucket_name': os.environ['AWS_STORAGE_BUCKET_NAME'],
+                'region_name': os.environ.get('AWS_S3_REGION_NAME', 'us-east-1'),
+                'access_key': os.environ.get('AWS_ACCESS_KEY_ID'),
+                'secret_key': os.environ.get('AWS_SECRET_ACCESS_KEY'),
+                'default_acl': None,  # el bucket controla acceso vía policy, no ACLs por objeto
+                'file_overwrite': False,
+                'querystring_auth': True,  # URLs firmadas y temporales (documentos con datos de clientes)
+                'querystring_expire': 3600,
+            },
+        },
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+else:
+    STORAGES = {
+        'default': {
+            'BACKEND': 'django.core.files.storage.FileSystemStorage',
+        },
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    }
+
 # Motor de plantillas (ver app 'plantillas'): binario de LibreOffice usado para
 # convertir el .docx renderizado a PDF, y límite de tamaño para plantillas subidas.
 LIBREOFFICE_BINARY = os.environ.get('LIBREOFFICE_BINARY', 'soffice')
 PLANTILLAS_MAX_UPLOAD_MB = int(os.environ.get('PLANTILLAS_MAX_UPLOAD_MB', 10))
+
+# Carpeta donde el equipo deja plantillas HTML de documentos (formato .dc.html
+# exportado desde Claude Design). El motor las adapta a página imprimible y
+# genera el PDF con WeasyPrint respetando el diseño original.
+DOCS_TEMPLATE_DIR = Path(os.environ.get(
+    'DOCS_TEMPLATE_DIR',
+    BASE_DIR.parent / 'clm_frontend' / 'public' / 'docs_template',
+))
 
 # Adjuntos de incidencias (capturas/logs, ver app 'incidencias')
 INCIDENCIAS_MAX_UPLOAD_MB = int(os.environ.get('INCIDENCIAS_MAX_UPLOAD_MB', 10))
