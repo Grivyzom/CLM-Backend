@@ -71,6 +71,7 @@ class Contrato(models.Model):
     sla = models.ForeignKey(SLA, on_delete=models.PROTECT, db_column='sla_id')
     
     etapa = models.CharField(max_length=30, choices=EtapaContrato.choices, default=EtapaContrato.BORRADOR)
+    nombre = models.CharField(max_length=255, blank=True, null=True, help_text="Nombre personalizado del contrato")
     tipo_contrato = models.CharField(max_length=30, choices=TipoContrato.choices)
     status = models.CharField(max_length=30, choices=EstadoContrato.choices, default=EstadoContrato.ACTIVO)
     monto = models.DecimalField(max_digits=15, decimal_places=4, default=0.0000)
@@ -87,6 +88,22 @@ class Contrato(models.Model):
     
     texto_adicional_clausulas = models.TextField(blank=True, null=True, help_text="Texto editable para contratos generados por cláusulas")
 
+    # Integración con procesadores de texto (Word / Google Docs)
+    external_editor = models.CharField(max_length=20, null=True, blank=True, choices=[('WORD', 'Microsoft Word'), ('GDOCS', 'Google Docs')], help_text="Procesador externo vinculado")
+    external_doc_id = models.CharField(max_length=255, null=True, blank=True, help_text="ID del documento en el procesador externo")
+    external_sync_status = models.CharField(max_length=20, default='NONE', choices=[('NONE', 'No vinculado'), ('SYNCED', 'Sincronizado'), ('OUT_OF_SYNC', 'Desactualizado'), ('EDITING', 'Editándose externamente')], help_text="Estado de la sincronización externa")
+    external_last_sync = models.DateTimeField(null=True, blank=True, help_text="Fecha y hora de la última sincronización")
+    external_locked_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='contratos_bloqueados_externamente', db_column='external_locked_by_id')
+    external_lock_expires = models.DateTimeField(null=True, blank=True, help_text="Expiración del bloqueo para edición externa")
+
+    # Integración con Firma Electrónica (DocuSign / Adobe Sign / Native OTP)
+    firma_proveedor = models.CharField(max_length=30, default='NONE', choices=[('NONE', 'Sin firmar'), ('OTP', 'Firma OTP Nativa'), ('DOCUSIGN', 'DocuSign'), ('ADOBE', 'Adobe Sign')], help_text="Proveedor de firma electrónica utilizado")
+    firma_status = models.CharField(max_length=20, default='NONE', choices=[('NONE', 'No enviado'), ('PENDING', 'Pendiente de firma'), ('SIGNED', 'Firmado'), ('DECLINED', 'Rechazado')], help_text="Estado del proceso de firma")
+    firma_envelope_id = models.CharField(max_length=255, null=True, blank=True, help_text="ID del sobre de firma (DocuSign Envelope ID / Adobe Agreement ID)")
+    firma_fecha_envio = models.DateTimeField(null=True, blank=True, help_text="Fecha de envío para firma")
+    firma_fecha_firma = models.DateTimeField(null=True, blank=True, help_text="Fecha en que se completó la firma")
+    firma_documento_firmado = models.FileField(upload_to='contratos_firmados/%Y/%m/%d/', null=True, blank=True, help_text="Documento final firmado y certificado")
+
     objects = models.Manager()
     scoped_objects = SoftwareScopedManager()
 
@@ -96,6 +113,8 @@ class Contrato(models.Model):
             models.Index(fields=['cliente', 'status'], name='idx_contrato_cliente_status'),
             models.Index(fields=['software', 'status'], name='idx_contrato_soft_status'),
             models.Index(fields=['tenant', 'status'], name='idx_contrato_tenant_status'),
+            models.Index(fields=['tenant', 'fecha_vencimiento'], name='idx_contrato_tenant_venc'),
+            models.Index(fields=['tenant', 'etapa'], name='idx_contrato_tenant_etapa'),
         ]
         constraints = [
             CheckConstraint(

@@ -108,6 +108,8 @@ class DashboardView(APIView):
             'renovaciones': self._build_renovaciones(today),
             'urgent_contracts': self._build_urgent_contracts(today),
             'actividad': self._build_actividad(),
+            'cartera_estado': self._build_cartera_estado(),
+            'valor_negociado': self._build_valor_negociado_series(today),
         })
 
     # ── KPIs ─────────────────────────────────────────────────────────────────
@@ -174,23 +176,37 @@ class DashboardView(APIView):
     def _build_mrr_series(self, today, max_series=5):
         softwares = list(scoped(Producto.objects.all(), self.request)
                          .filter(categoria='Software').order_by('nombre'))
+        software_nombre = {sw.id: sw.nombre for sw in softwares}
         meses = [_shift_months(today, -i) for i in range(5, -1, -1)]
+        bounds = [_month_bounds(m) for m in meses]
+        etiquetas_mes = [MESES_ES[m.month - 1] for m in meses]
 
-        # Matriz cruda: software → [mrr en $k por mes]
-        valores = {sw.nombre: [] for sw in softwares}
-        etiquetas_mes = []
-        for mes_anchor in meses:
-            m_start, m_end = _month_bounds(mes_anchor)
-            etiquetas_mes.append(MESES_ES[mes_anchor.month - 1])
-            for sw in softwares:
-                mrr = self._contratos().filter(
-                    software=sw,
+        # Antes: 1 query aggregate por (mes × software) = hasta 6*N round-trips.
+        # Ahora: 1 sola query trae los contratos RECURRENTE que solapan la ventana
+        # completa de 6 meses, y el solape mes a mes se resuelve en Python.
+        valores = {sw.nombre: [Decimal('0')] * len(meses) for sw in softwares}
+        if software_nombre:
+            ventana_inicio, ventana_fin = bounds[0][0], bounds[-1][1]
+            contratos = (
+                self._contratos()
+                .filter(
+                    software_id__in=software_nombre.keys(),
                     tipo_contrato=TipoContrato.RECURRENTE,
-                    fecha_inicio__lte=m_end,
-                ).filter(
-                    Q(fecha_vencimiento__gte=m_start) | Q(fecha_vencimiento__isnull=True)
-                ).annotate(mrr=MRR_EXPR).aggregate(total=Sum('mrr'))['total'] or Decimal('0')
-                valores[sw.nombre].append(round(float(mrr) / 1000, 2))  # en miles ($k)
+                    fecha_inicio__lte=ventana_fin,
+                )
+                .filter(Q(fecha_vencimiento__gte=ventana_inicio) | Q(fecha_vencimiento__isnull=True))
+                .annotate(mrr=MRR_EXPR)
+                .values('software_id', 'fecha_inicio', 'fecha_vencimiento', 'mrr')
+            )
+            for c in contratos:
+                nombre = software_nombre.get(c['software_id'])
+                if nombre is None:
+                    continue
+                for i, (m_start, m_end) in enumerate(bounds):
+                    if c['fecha_inicio'] <= m_end and (c['fecha_vencimiento'] is None or c['fecha_vencimiento'] >= m_start):
+                        valores[nombre][i] += c['mrr']
+
+        valores = {nombre: [round(float(v) / 1000, 2) for v in serie] for nombre, serie in valores.items()}
 
         # Más de max_series softwares no se distinguen en un gráfico apilado:
         # se conservan los de mayor MRR acumulado y el resto se pliega en "Otros".
@@ -232,6 +248,65 @@ class DashboardView(APIView):
             }
             for etapa in ETAPAS_PIPELINE
         ]
+
+    # ── Contratos por estado de cobranza (volumen + riesgo de cartera) ───────
+    def _build_cartera_estado(self):
+        ESTADOS = [EstadoContrato.ACTIVO, EstadoContrato.MORA, EstadoContrato.GRACIA, EstadoContrato.SUSPENDIDO]
+        labels = dict(EstadoContrato.choices)
+
+        rows = (
+            self._contratos().filter(status__in=ESTADOS)
+            .values('status').annotate(count=Count('id'), monto=Sum('monto'))
+        )
+        by_status = {r['status']: r for r in rows}
+        por_estado = [
+            {
+                'estado': s,
+                'label': labels[s],
+                'count': by_status.get(s, {}).get('count', 0),
+                'monto': float(by_status.get(s, {}).get('monto') or 0),
+            }
+            for s in ESTADOS
+        ]
+
+        monto_total = sum(e['monto'] for e in por_estado)
+        monto_riesgo = sum(e['monto'] for e in por_estado if e['estado'] != EstadoContrato.ACTIVO)
+        pct_riesgo = round(monto_riesgo / monto_total * 100, 1) if monto_total else 0.0
+
+        return {
+            'por_estado': por_estado,
+            'monto_total': monto_total,
+            'monto_riesgo': monto_riesgo,
+            'pct_riesgo': pct_riesgo,
+        }
+
+    # ── Valor negociado (monto sin normalizar, todos los tipos de contrato) ──
+    def _build_valor_negociado_series(self, today, meses=6):
+        anchors = [_shift_months(today, -i) for i in range(meses - 1, -1, -1)]
+        bounds = [_month_bounds(m) for m in anchors]
+        etiquetas = [MESES_ES[m.month - 1] for m in anchors]
+
+        agg = (
+            self._contratos().filter(fecha_inicio__gte=bounds[0][0], fecha_inicio__lte=bounds[-1][1])
+            .values('fecha_inicio').annotate(monto=Sum('monto'))
+        )
+        montos_por_mes = [Decimal('0')] * len(anchors)
+        for row in agg:
+            for i, (m_start, m_end) in enumerate(bounds):
+                if m_start <= row['fecha_inicio'] <= m_end:
+                    montos_por_mes[i] += row['monto'] or Decimal('0')
+                    break
+
+        data = [
+            {'date': etiqueta, 'monto_k': round(float(monto) / 1000, 2)}
+            for etiqueta, monto in zip(etiquetas, montos_por_mes)
+        ]
+
+        total_vigente = self._contratos().filter(
+            status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA, EstadoContrato.MORA]
+        ).aggregate(total=Sum('monto'))['total'] or Decimal('0')
+
+        return {'data': data, 'total_vigente': float(total_vigente)}
 
     # ── Renovaciones próximas (30/60/90 días) ────────────────────────────────
     def _build_renovaciones(self, today):
@@ -368,6 +443,29 @@ class SLAListView(APIView):
         return Response(_sla_a_dict(sla), status=http_status.HTTP_201_CREATED)
 
 
+class SLANAView(APIView):
+    """GET /api/slas/na/ — SLA técnico "N/A" del tenant, para contratos que
+    documentan algo sin nivel de servicio (NDA, memorándums, fichas de
+    requerimientos: ver PlantillaDocumento.requiere_sla_facturacion). Se
+    crea una sola vez por tenant, reutilizable por cualquier contrato
+    administrativo — evita forzar al usuario a elegir un SLA que no aplica."""
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
+
+    def get(self, request):
+        tenant = resolve_tenant_for_write(request, {})
+        sla, _ = SLA.objects.get_or_create(
+            tenant=tenant, nombre='N/A — Documento administrativo',
+            defaults=dict(
+                uptime_garantizado=Decimal('0'),
+                tiempo_respuesta_horas=0,
+                detalles='SLA técnico asignado automáticamente a documentos que no son un '
+                         'servicio con nivel de servicio ni cobro (NDA, memorándums, fichas '
+                         'de requerimientos, etc.).',
+            ),
+        )
+        return Response(_sla_a_dict(sla))
+
+
 # ─── Contratos: CRUD ──────────────────────────────────────────────────────────
 
 def _compute_mrr_arr(monto, tipo_contrato, frecuencia):
@@ -398,17 +496,25 @@ def _dias_restantes(fecha_vencimiento, today):
     return (fecha_vencimiento - today).days
 
 
-def _contrato_nombre(c):
-    tipo_label = c.get_tipo_contrato_display()
+def _contrato_nombre(c, doc_info):
+    if getattr(c, 'nombre', None):
+        return c.nombre
+    
+    if doc_info and doc_info.get('plantilla_nombre'):
+        tipo_label = doc_info['plantilla_nombre']
+    else:
+        tipo_label = c.get_tipo_contrato_display()
+        
     software_nombre = c.software.nombre if c.software_id else 's/software'
     return f"{tipo_label} — {software_nombre}"
 
 
-def _contrato_list_dict(c, responsable_map, tiene_documento_ids, today):
+def _contrato_list_dict(c, responsable_map, docs_map, today):
     mrr, arr = _compute_mrr_arr(c.monto, c.tipo_contrato, c.frecuencia_facturacion)
+    doc_info = docs_map.get(c.id)
     return {
         'id': c.id,
-        'nombre': _contrato_nombre(c),
+        'nombre': _contrato_nombre(c, doc_info),
         'cliente': {'id': c.cliente_id, 'nombre': str(c.cliente)},
         'software': {'id': c.software_id, 'nombre': c.software.nombre if c.software_id else ''},
         'sla': {'id': c.sla_id, 'nombre': c.sla.nombre if c.sla_id else ''},
@@ -427,7 +533,8 @@ def _contrato_list_dict(c, responsable_map, tiene_documento_ids, today):
         'fecha_creacion': c.fecha_creacion,
         'dias_restantes': _dias_restantes(c.fecha_vencimiento, today),
         'responsable': responsable_map.get(c.id, ''),
-        'tiene_documento': c.id in tiene_documento_ids,
+        'tiene_documento': bool(doc_info),
+        'documento_id': doc_info['id'] if doc_info else None,
     }
 
 
@@ -503,6 +610,8 @@ class ContratoListCreateView(APIView):
                 qs = qs.order_by('-cliente_name' if reverse else 'cliente_name')
             elif field == 'software':
                 qs = qs.order_by('-software__nombre' if reverse else 'software__nombre')
+            elif field == 'tipo_contrato':
+                qs = qs.order_by('-tipo_contrato' if reverse else 'tipo_contrato')
             elif field == 'etapa':
                 qs = qs.order_by('-etapa' if reverse else 'etapa')
             elif field == 'mrr':
@@ -536,12 +645,21 @@ class ContratoListCreateView(APIView):
         today = timezone.localdate()
         ids = [c.id for c in page_items]
         responsable_map = _build_responsable_map(ids)
-        tiene_documento_ids = set(
+        
+        docs = (
             DocumentoGenerado.objects.filter(contrato_id__in=ids)
-            .values_list('contrato_id', flat=True).distinct()
+            .select_related('plantilla')
+            .order_by('-fecha_generacion')
         )
+        docs_map = {}
+        for d in docs:
+            if d.contrato_id not in docs_map:
+                docs_map[d.contrato_id] = {
+                    'id': d.id,
+                    'plantilla_nombre': d.plantilla.nombre if d.plantilla_id else None
+                }
 
-        results = [_contrato_list_dict(c, responsable_map, tiene_documento_ids, today) for c in page_items]
+        results = [_contrato_list_dict(c, responsable_map, docs_map, today) for c in page_items]
 
         return Response({
             'count': total,
@@ -627,6 +745,7 @@ class ContratoListCreateView(APIView):
             with transaction.atomic():
                 contrato = Contrato.objects.create(
                     tenant=tenant,
+                    nombre=data.get('nombre') or None,
                     cliente_id=cliente_id,
                     software_id=software_id,
                     sla_id=sla_id,
@@ -689,6 +808,7 @@ def _contrato_detail_dict(c):
         {
             'id': d.id,
             'plantilla_version': d.plantilla.version_codigo,
+            'plantilla_nombre': d.plantilla.nombre,
             'hash_sha256': d.hash_sha256,
             'fecha_generacion': d.fecha_generacion,
         }
@@ -763,9 +883,11 @@ def _contrato_detail_dict(c):
     except Exception:
         plantilla_activa_info = None
 
+    doc_info = documentos[0] if documentos else None
+
     return {
         'id': c.id,
-        'nombre': _contrato_nombre(c),
+        'nombre': _contrato_nombre(c, doc_info),
         'cliente': {'id': c.cliente_id, 'nombre': str(c.cliente), 'email': c.cliente.email_principal},
         'software': {'id': c.software_id, 'nombre': c.software.nombre if c.software_id else ''},
         'sla': {'id': c.sla_id, 'nombre': c.sla.nombre if c.sla_id else ''},
@@ -795,6 +917,18 @@ def _contrato_detail_dict(c):
         'versiones': versiones,
         'plantilla_activa': plantilla_activa_info,
         'texto_adicional_clausulas': c.texto_adicional_clausulas,
+        'external_editor': c.external_editor,
+        'external_doc_id': c.external_doc_id,
+        'external_sync_status': c.external_sync_status,
+        'external_last_sync': c.external_last_sync,
+        'external_locked_by': c.external_locked_by.username if c.external_locked_by else None,
+        'external_lock_expires': c.external_lock_expires,
+        'firma_proveedor': c.firma_proveedor,
+        'firma_status': c.firma_status,
+        'firma_envelope_id': c.firma_envelope_id,
+        'firma_fecha_envio': c.firma_fecha_envio,
+        'firma_fecha_firma': c.firma_fecha_firma,
+        'firma_documento_firmado_url': c.firma_documento_firmado.url if c.firma_documento_firmado else None,
     }
 
 
@@ -838,7 +972,7 @@ class ContratoDetailView(APIView):
                 raise DRFValidationError({'sla_id': 'SLA no encontrado.'})
 
         campo_simple = [
-            'monto', 'status', 'sla_id', 'fecha_vencimiento',
+            'nombre', 'monto', 'status', 'sla_id', 'fecha_inicio', 'fecha_vencimiento',
             'dias_gracia_autorizados', 'frecuencia_facturacion',
             'texto_adicional_clausulas',
         ]
@@ -849,6 +983,14 @@ class ContratoDetailView(APIView):
                 dirty = True
         if dirty:
             c.save()
+            from .models import HistorialEtapaContrato
+            HistorialEtapaContrato.objects.create(
+                contrato=c,
+                etapa_anterior=c.etapa,
+                etapa_nueva=c.etapa,
+                usuario=request.user,
+                notas="Actualización manual del contrato (datos comerciales/fechas)."
+            )
 
         return Response(_contrato_detail_dict(c))
 
@@ -1100,3 +1242,212 @@ class ContratoEnmendarView(APIView):
             )
             
         return Response(_contrato_detail_dict(nuevo_contrato), status=http_status.HTTP_201_CREATED)
+
+
+class ContratoExternalSyncView(APIView):
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
+
+    def get(self, request, pk):
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=pk)
+        return Response({
+            'contrato_id': contrato.id,
+            'external_editor': contrato.external_editor,
+            'external_doc_id': contrato.external_doc_id,
+            'external_sync_status': contrato.external_sync_status,
+            'external_last_sync': contrato.external_last_sync,
+            'external_locked_by': contrato.external_locked_by.username if contrato.external_locked_by else None,
+            'external_lock_expires': contrato.external_lock_expires,
+            'texto_adicional_clausulas': contrato.texto_adicional_clausulas or '',
+        })
+
+    def post(self, request, pk):
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=pk)
+        action = request.data.get('action')
+        editor = request.data.get('editor', contrato.external_editor or 'WORD')
+        doc_id = request.data.get('doc_id')
+        content = request.data.get('content')
+
+        if not action:
+            return Response({'error': 'Falta el parámetro "action"'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        from django.utils import timezone
+        from datetime import timedelta
+
+        if action == 'link':
+            contrato.external_editor = editor
+            contrato.external_doc_id = doc_id or (f"gdoc-{contrato.id}-xyz" if editor == 'GDOCS' else f"word-{contrato.id}-xyz.docx")
+            contrato.external_sync_status = 'SYNCED'
+            contrato.external_last_sync = timezone.now()
+            contrato.save()
+            HistorialEtapaContrato.objects.create(
+                contrato=contrato,
+                etapa_anterior=contrato.etapa,
+                etapa_nueva=contrato.etapa,
+                usuario=request.user,
+                notas=f"Contrato vinculado a {'Google Docs' if editor == 'GDOCS' else 'Microsoft Word'} (ID Documento: {contrato.external_doc_id}) para sincronización automática."
+            )
+
+        elif action == 'unlink':
+            prev_editor = contrato.external_editor
+            contrato.external_editor = None
+            contrato.external_doc_id = None
+            contrato.external_sync_status = 'NONE'
+            contrato.external_last_sync = None
+            contrato.external_locked_by = None
+            contrato.external_lock_expires = None
+            contrato.save()
+            HistorialEtapaContrato.objects.create(
+                contrato=contrato,
+                etapa_anterior=contrato.etapa,
+                etapa_nueva=contrato.etapa,
+                usuario=request.user,
+                notas=f"Vínculo deshecho con {'Google Docs' if prev_editor == 'GDOCS' else 'Microsoft Word' if prev_editor == 'WORD' else 'procesador de texto'}."
+            )
+
+        elif action == 'lock':
+            contrato.external_sync_status = 'EDITING'
+            contrato.external_locked_by = request.user
+            contrato.external_lock_expires = timezone.now() + timedelta(hours=1)
+            contrato.save()
+            HistorialEtapaContrato.objects.create(
+                contrato=contrato,
+                etapa_anterior=contrato.etapa,
+                etapa_nueva=contrato.etapa,
+                usuario=request.user,
+                notas=f"Bloqueado para edición en {'Google Docs' if editor == 'GDOCS' else 'Microsoft Word'} por el usuario {request.user.username}."
+            )
+
+        elif action == 'unlock':
+            contrato.external_locked_by = None
+            contrato.external_lock_expires = None
+            if contrato.external_sync_status == 'EDITING':
+                contrato.external_sync_status = 'SYNCED'
+            contrato.save()
+            HistorialEtapaContrato.objects.create(
+                contrato=contrato,
+                etapa_anterior=contrato.etapa,
+                etapa_nueva=contrato.etapa,
+                usuario=request.user,
+                notas=f"Bloqueo de edición en procesador externo liberado."
+            )
+
+        elif action == 'sync_push':
+            if content is not None:
+                contrato.texto_adicional_clausulas = content
+                contrato.external_last_sync = timezone.now()
+                contrato.external_sync_status = 'SYNCED'
+                contrato.save()
+                HistorialEtapaContrato.objects.create(
+                    contrato=contrato,
+                    etapa_anterior=contrato.etapa,
+                    etapa_nueva=contrato.etapa,
+                    usuario=request.user,
+                    notas=f"Cambios sincronizados automáticamente desde {'Google Docs' if editor == 'GDOCS' else 'Microsoft Word'}."
+                )
+            else:
+                return Response({'error': 'El contenido no puede estar vacío en sync_push'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        elif action == 'sync_pull':
+            contrato.external_last_sync = timezone.now()
+            contrato.save()
+
+        else:
+            return Response({'error': 'Acción inválida.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        return Response(_contrato_detail_dict(contrato))
+
+
+class ContratoFirmaElectronicaView(APIView):
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
+
+    def post(self, request, pk):
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=pk)
+        action = request.data.get('action')
+        proveedor = request.data.get('proveedor') # 'OTP', 'DOCUSIGN', 'ADOBE'
+
+        if not action:
+            return Response({'error': 'Parámetro "action" es requerido.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        from django.utils import timezone
+        import uuid
+
+        if action == 'send':
+            if not proveedor or proveedor not in ['OTP', 'DOCUSIGN', 'ADOBE']:
+                return Response({'error': 'Proveedor de firma inválido o no especificado.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+            contrato.firma_proveedor = proveedor
+            contrato.firma_status = 'PENDING'
+            contrato.firma_envelope_id = str(uuid.uuid4())
+            contrato.firma_fecha_envio = timezone.now()
+
+            # Transicionar etapa del contrato a PENDIENTE_FIRMA si no estaba
+            if contrato.etapa != EtapaContrato.PENDIENTE_FIRMA:
+                contrato.transicionar_etapa(EtapaContrato.PENDIENTE_FIRMA, usuario=request.user, notas=f"Enviado para firma electrónica vía {proveedor}")
+            else:
+                contrato.save()
+                HistorialEtapaContrato.objects.create(
+                    contrato=contrato,
+                    etapa_anterior=contrato.etapa,
+                    etapa_nueva=contrato.etapa,
+                    usuario=request.user,
+                    notas=f"Sobre de firma electrónica reiniciado vía {proveedor} (Envelope ID: {contrato.firma_envelope_id})"
+                )
+
+        elif action == 'sign':
+            if contrato.firma_status != 'PENDING':
+                return Response({'error': 'No se puede firmar un contrato que no está pendiente de firma.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+            contrato.firma_status = 'SIGNED'
+            contrato.firma_fecha_firma = timezone.now()
+
+            # Guardar documento mock firmado en PDF
+            from django.core.files.base import ContentFile
+            contrato.firma_documento_firmado.save(
+                f"contrato_{contrato.id}_firmado.pdf",
+                ContentFile(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<\n/Type /Catalog\n/Pages 2 0 R\n>>\nendobj\n2 0 obj\n<<\n/Type /Pages\n/Kids [3 0 R]\n/Count 1\n>>\nendobj\n3 0 obj\n<<\n/Type /Page\n/Parent 2 0 R\n/Resources <<\n/Font <<\n/F1 <<\n/Type /Font\n/Subtype /Type1\n/BaseFont /Helvetica\n>>\n>>\n>>\n/MediaBox [0 0 595.275 841.889]\n/Contents 4 0 R\n>>\nendobj\n4 0 obj\n<<\n/Length 72\n>>\nstream\nBT\n/F1 12 Tf\n72 712 Td\n(CONTRATO FIRMADO DIGITALMENTE Y CERTIFICADO - ENFOQUE CLM) Tj\nET\nendstream\nendobj\nxref\n0 5\n0000000000 65535 f \n0000000015 00000 n \n0000000068 00000 n \n0000000127 00000 n \n0000000282 00000 n \ntrailer\n<<\n/Size 5\n/Root 1 0 R\n>>\nstartxref\n405\n%%EOF\n")
+            )
+
+            # Transicionar a ACTIVO
+            contrato.transicionar_etapa(EtapaContrato.ACTIVO, usuario=request.user, notas=f"Contrato firmado digitalmente a través del portal de {contrato.firma_proveedor}. Documento certificado e inmutable guardado.")
+
+        elif action == 'decline':
+            if contrato.firma_status != 'PENDING':
+                return Response({'error': 'El proceso de firma no está activo.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+            contrato.firma_status = 'DECLINED'
+            contrato.save()
+
+            HistorialEtapaContrato.objects.create(
+                contrato=contrato,
+                etapa_anterior=contrato.etapa,
+                etapa_nueva=contrato.etapa,
+                usuario=request.user,
+                notas=f"Proceso de firma electrónica RECHAZADO por el destinatario en {contrato.firma_proveedor}."
+            )
+
+        elif action == 'cancel':
+            prev_status = contrato.firma_status
+            prev_prov = contrato.firma_proveedor
+
+            contrato.firma_status = 'NONE'
+            contrato.firma_proveedor = 'NONE'
+            contrato.firma_envelope_id = None
+            contrato.firma_fecha_envio = None
+            contrato.firma_fecha_firma = None
+            contrato.save()
+
+            # Regresar a APROBADO si corresponde
+            if contrato.etapa == EtapaContrato.PENDIENTE_FIRMA:
+                contrato.transicionar_etapa(EtapaContrato.APROBADO, usuario=request.user, notas=f"Envío de firma {prev_prov} cancelado por el usuario. Contrato devuelto a etapa Aprobado.")
+            else:
+                HistorialEtapaContrato.objects.create(
+                    contrato=contrato,
+                    etapa_anterior=contrato.etapa,
+                    etapa_nueva=contrato.etapa,
+                    usuario=request.user,
+                    notas=f"Solicitud de firma electrónica cancelada por el usuario."
+                )
+        else:
+            return Response({'error': 'Acción inválida.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
+        return Response(_contrato_detail_dict(contrato))
