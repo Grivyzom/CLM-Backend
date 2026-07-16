@@ -136,6 +136,29 @@ def api_me(request):
     return JsonResponse(_user_payload(request.user))
 
 
+def enviar_correo_reset_password(user):
+    """Genera el token de un solo uso (default_token_generator, el mismo que
+    valida api_password_reset_confirm) y envía el correo con el enlace de
+    /recuperar/confirmar/. Reutilizada por api_password_reset (autoservicio,
+    por identifier) y por PlatformUserResetPasswordView (acción de un
+    Administrador/Moderador sobre un usuario puntual, ver tenants/views.py)."""
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user)
+    url = f"{settings.FRONTEND_BASE_URL}/recuperar/confirmar/{uid}/{token}"
+    send_mail(
+        'Restablecer contraseña — Enfoque Platform',
+        (
+            f'Hola {user.username},\n\n'
+            'Recibimos una solicitud para restablecer tu contraseña en Enfoque Platform (CLM).\n\n'
+            f'Abre este enlace para definir una nueva contraseña:\n{url}\n\n'
+            'El enlace es de un solo uso y expira pronto. Si no solicitaste esto, '
+            'ignora este correo: tu contraseña no cambia.'
+        ),
+        None,  # DEFAULT_FROM_EMAIL
+        [user.email],
+    )
+
+
 @csrf_exempt
 @require_POST
 def api_password_reset(request):
@@ -160,22 +183,8 @@ def api_password_reset(request):
         is_active=True,
     ).exclude(email='')
     for user in candidates:
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        token = default_token_generator.make_token(user)
-        url = f"{settings.FRONTEND_BASE_URL}/recuperar/confirmar/{uid}/{token}"
         try:
-            send_mail(
-                'Restablecer contraseña — Enfoque Platform',
-                (
-                    f'Hola {user.username},\n\n'
-                    'Recibimos una solicitud para restablecer tu contraseña en Enfoque Platform (CLM).\n\n'
-                    f'Abre este enlace para definir una nueva contraseña:\n{url}\n\n'
-                    'El enlace es de un solo uso y expira pronto. Si no solicitaste esto, '
-                    'ignora este correo: tu contraseña no cambia.'
-                ),
-                None,  # DEFAULT_FROM_EMAIL
-                [user.email],
-            )
+            enviar_correo_reset_password(user)
         except Exception:
             # No filtrar el fallo al cliente: la respuesta sigue siendo genérica
             logger.exception('Fallo al enviar correo de reset para user id=%s', user.pk)

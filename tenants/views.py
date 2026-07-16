@@ -1,12 +1,16 @@
-from django.db import transaction
+import uuid
+
+from django.db import models, transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from core.views import enviar_correo_reset_password
+
 from .membresias import asignar_membresia, cancelar_membresia
-from .models import CategoriaSuscripcion, EstadoTenant, RolTenant, Tenant, User
+from .models import CategoriaSuscripcion, EstadoTenant, RolPlataforma, RolTenant, Tenant, User
 from .permisos import tiene_permiso
 from .permissions import (
     IsSuperAdmin, IsSuperAdminOrModerador, IsTenantMember, RequierePermiso,
@@ -54,6 +58,30 @@ def _serialize_user(user):
         'is_active': user.is_active,
         'tenant_id': str(user.tenant_id) if user.tenant_id else None,
     }
+
+
+def _serialize_platform_user(user):
+    """Vista global de usuarios (cross-tenant): incluye de dónde viene la
+    cuenta (staff de plataforma / empresa / cliente externo) para que
+    /usuarios pueda mostrar y filtrar sin joins adicionales en el frontend."""
+    if user.tenant_id is None:
+        tipo_cuenta = 'PLATAFORMA'
+    elif user.role == RolTenant.CLIENTE:
+        tipo_cuenta = 'CLIENTE'
+    else:
+        tipo_cuenta = 'EMPRESA'
+
+    data = _serialize_user(user)
+    data.update({
+        'platform_role': user.platform_role,
+        'tenant_razon_social': user.tenant.razon_social if user.tenant_id else None,
+        'cliente_id': user.cliente_id,
+        'cliente_nombre': str(user.cliente) if user.cliente_id else None,
+        'tipo_cuenta': tipo_cuenta,
+        'date_joined': user.date_joined.isoformat(),
+        'last_login': user.last_login.isoformat() if user.last_login else None,
+    })
+    return data
 
 
 class TenantListCreateView(APIView):
@@ -258,6 +286,202 @@ class TenantUserDetailView(APIView):
         with transaction.atomic():
             target.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _es_par_o_superior_plataforma(user):
+    """SUPERADMIN/MODERADOR de plataforma: gestionarlos queda reservado a
+    SuperAdmin (Moderador no gestiona pares ni superiores). TRABAJADOR y
+    cuentas de tenant/cliente sí quedan al alcance de Moderador."""
+    return user.tenant_id is None and user.platform_role in (RolPlataforma.SUPERADMIN, RolPlataforma.MODERADOR)
+
+
+class PlatformUserListView(APIView):
+    """Nivel plataforma: TODAS las cuentas (staff global + usuarios de
+    cualquier tenant + clientes externos), sin scoping por tenant — a
+    diferencia de TenantUserListCreateView, que exige ?tenant=<uuid>."""
+    permission_classes = [IsSuperAdminOrModerador]
+
+    def get(self, request):
+        qs = User.objects.select_related('tenant', 'cliente').all()
+
+        search = request.query_params.get('search', '').strip()
+        if search:
+            qs = qs.filter(
+                models.Q(username__icontains=search)
+                | models.Q(email__icontains=search)
+                | models.Q(first_name__icontains=search)
+                | models.Q(last_name__icontains=search)
+                | models.Q(tenant__razon_social__icontains=search)
+            )
+
+        tipo_cuenta = request.query_params.get('tipo_cuenta', 'TODOS').upper()
+        if tipo_cuenta == 'PLATAFORMA':
+            qs = qs.filter(tenant__isnull=True)
+        elif tipo_cuenta == 'CLIENTE':
+            qs = qs.filter(tenant__isnull=False, role=RolTenant.CLIENTE)
+        elif tipo_cuenta == 'EMPRESA':
+            qs = qs.filter(tenant__isnull=False).exclude(role=RolTenant.CLIENTE)
+
+        estado = request.query_params.get('estado', 'TODOS').upper()
+        if estado == 'ACTIVO':
+            qs = qs.filter(is_active=True)
+        elif estado == 'INACTIVO':
+            qs = qs.filter(is_active=False)
+
+        tenant_id = request.query_params.get('tenant_id', '').strip()
+        if tenant_id:
+            try:
+                qs = qs.filter(tenant_id=uuid.UUID(tenant_id))
+            except ValueError:
+                qs = qs.none()
+
+        ordering = request.query_params.get('ordering', 'username')
+        if ordering.lstrip('-') not in ('username', 'date_joined', 'last_login'):
+            ordering = 'username'
+        qs = qs.order_by(ordering)
+
+        try:
+            page = max(1, int(request.query_params.get('page', 1)))
+            page_size = min(100, max(1, int(request.query_params.get('page_size', 20))))
+        except (ValueError, TypeError):
+            page, page_size = 1, 20
+        offset = (page - 1) * page_size
+
+        total = qs.count()
+        stats = {
+            'total': total,
+            'activos': qs.filter(is_active=True).count(),
+            'inactivos': qs.filter(is_active=False).count(),
+            'plataforma': qs.filter(tenant__isnull=True).count(),
+            'empresa': qs.filter(tenant__isnull=False).exclude(role=RolTenant.CLIENTE).count(),
+            'cliente': qs.filter(tenant__isnull=False, role=RolTenant.CLIENTE).count(),
+        }
+
+        page_items = qs[offset: offset + page_size]
+
+        return Response({
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': max(1, -(-total // page_size)),
+            'stats': stats,
+            'results': [_serialize_platform_user(u) for u in page_items],
+        })
+
+
+class PlatformUserDetailView(APIView):
+    """Edición/eliminación de cualquier cuenta desde la vista global. Ver
+    _es_par_o_superior_plataforma para el candado de Moderador sobre pares."""
+    permission_classes = [IsSuperAdminOrModerador]
+
+    def get_object(self, pk):
+        try:
+            return User.objects.select_related('tenant', 'cliente').get(pk=pk)
+        except (User.DoesNotExist, ValueError):
+            return None
+
+    def patch(self, request, pk):
+        target = self.get_object(pk)
+        if not target:
+            return Response({'error': 'Usuario no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        if _es_par_o_superior_plataforma(target) and not request.user.is_superadmin:
+            return Response(
+                {'error': 'Solo el Super Administrador puede gestionar cuentas de Moderador o Super Administrador.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        es_uno_mismo = target.pk == request.user.pk
+
+        if 'platform_role' in request.data:
+            if not request.user.is_superadmin:
+                return Response({'error': 'Solo el Super Administrador puede asignar roles de plataforma.'},
+                                status=status.HTTP_403_FORBIDDEN)
+            if target.tenant_id is not None:
+                return Response({'error': 'platform_role solo aplica a cuentas sin empresa asociada.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            if es_uno_mismo:
+                return Response({'error': 'No puedes cambiar tu propio rol de plataforma.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            platform_role = request.data['platform_role'] or None
+            if platform_role is not None and platform_role not in RolPlataforma.values:
+                return Response({'error': f'Rol de plataforma inválido. Opciones: {RolPlataforma.values}'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            target.platform_role = platform_role
+
+        if 'role' in request.data:
+            if target.tenant_id is None:
+                return Response({'error': 'role solo aplica a cuentas de una empresa.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            role = request.data['role']
+            if role not in RolTenant.values:
+                return Response({'error': f'Rol inválido. Opciones: {RolTenant.values}'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            target.role = role
+
+        if 'is_active' in request.data:
+            is_active = bool(request.data['is_active'])
+            if es_uno_mismo and not is_active:
+                return Response({'error': 'No puedes desactivar tu propia cuenta.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            target.is_active = is_active
+
+        for field in ('email', 'first_name', 'last_name'):
+            if field in request.data:
+                setattr(target, field, request.data[field])
+
+        password = request.data.get('password')
+        if password:
+            target.set_password(password)
+
+        target.save()
+        return Response(_serialize_platform_user(target))
+
+    def delete(self, request, pk):
+        target = self.get_object(pk)
+        if not target:
+            return Response({'error': 'Usuario no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+        if target.pk == request.user.pk:
+            return Response({'error': 'No puedes eliminar tu propia cuenta'}, status=status.HTTP_400_BAD_REQUEST)
+        if _es_par_o_superior_plataforma(target) and not request.user.is_superadmin:
+            return Response(
+                {'error': 'Solo el Super Administrador puede eliminar cuentas de Moderador o Super Administrador.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        with transaction.atomic():
+            target.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PlatformUserResetPasswordView(APIView):
+    """Acción de Administrador/Moderador: envía al usuario el mismo correo de
+    'restablecer contraseña' que dispara /recuperar (mismo token de un solo
+    uso), sin pedirle el correo/usuario — el admin ya sabe que la cuenta
+    existe, así que no aplica el mensaje anti-enumeración de esa vista."""
+    permission_classes = [IsSuperAdminOrModerador]
+
+    def post(self, request, pk):
+        try:
+            target = User.objects.get(pk=pk)
+        except (User.DoesNotExist, ValueError):
+            return Response({'error': 'Usuario no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        if _es_par_o_superior_plataforma(target) and not request.user.is_superadmin:
+            return Response(
+                {'error': 'Solo el Super Administrador puede gestionar cuentas de Moderador o Super Administrador.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if not target.is_active:
+            return Response({'error': 'La cuenta está desactivada.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not target.email:
+            return Response({'error': 'El usuario no tiene un correo asociado.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            enviar_correo_reset_password(target)
+        except Exception:
+            return Response({'error': 'No se pudo enviar el correo. Intenta nuevamente.'},
+                            status=status.HTTP_502_BAD_GATEWAY)
+        return Response({'success': f'Enviamos un enlace de restablecimiento a {target.email}.'})
 
 
 class TenantMembresiaView(APIView):
