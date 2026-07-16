@@ -1,7 +1,8 @@
 import calendar
 from decimal import Decimal
 
-from django.db.models import Q, Sum, Count, Case, When, F, DecimalField
+from django.db.models import Q, Sum, Count, Case, When, F, DecimalField, Avg, DurationField, ExpressionWrapper
+from django.db.models.functions import TruncMonth
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -91,13 +92,15 @@ class AnalyticsView(APIView):
         ).annotate(mrr=MRR_EXPR).aggregate(total=Sum('mrr'))['total'] or Decimal('0')
 
         # Duración contratada media, solo contratos con vencimiento definido.
-        duraciones = [
-            (c['fecha_vencimiento'] - c['fecha_inicio']).days
-            for c in self._contratos().filter(fecha_vencimiento__isnull=False)
-            .values('fecha_inicio', 'fecha_vencimiento')
-            if c['fecha_vencimiento'] >= c['fecha_inicio']
-        ]
-        duracion_meses = round(sum(duraciones) / len(duraciones) / 30.44, 1) if duraciones else 0
+        # Antes traía fecha_inicio/fecha_vencimiento de todos los contratos a
+        # Python para promediar; ahora el promedio lo calcula la DB.
+        avg_duracion = self._contratos().filter(
+            fecha_vencimiento__isnull=False,
+            fecha_vencimiento__gte=F('fecha_inicio'),
+        ).aggregate(
+            avg=Avg(ExpressionWrapper(F('fecha_vencimiento') - F('fecha_inicio'), output_field=DurationField()))
+        )['avg']
+        duracion_meses = round(avg_duracion.days / 30.44, 1) if avg_duracion else 0
 
         monto_recurrente = activos.filter(
             tipo_contrato=TipoContrato.RECURRENTE
@@ -199,42 +202,68 @@ class AnalyticsView(APIView):
 
     # ── Flujo: contratos iniciados vs terminados por mes (últimos 12) ────────
     def _build_flujo(self, today):
-        data = []
-        for i in range(11, -1, -1):
-            anchor = _shift_months(today, -i)
-            m_start, m_end = _month_bounds(anchor)
-            iniciados = self._contratos().filter(
-                fecha_inicio__gte=m_start, fecha_inicio__lte=m_end
-            ).count()
-            terminados = scoped(HistorialEtapaContrato.objects.all(), self.request, 'contrato__tenant').filter(
+        # Antes: 2 queries × 12 meses = 24 round-trips. Ahora: 2 queries totales,
+        # agrupadas por mes con TruncMonth, mapeadas en Python a los 12 buckets.
+        meses = [_shift_months(today, -i) for i in range(11, -1, -1)]
+        ventana_inicio, ventana_fin = _month_bounds(meses[0])[0], _month_bounds(meses[-1])[1]
+
+        iniciados_rows = (
+            self._contratos()
+            .filter(fecha_inicio__gte=ventana_inicio, fecha_inicio__lte=ventana_fin)
+            .annotate(mes=TruncMonth('fecha_inicio'))
+            .values('mes').annotate(n=Count('id'))
+        )
+        iniciados_map = {(r['mes'].year, r['mes'].month): r['n'] for r in iniciados_rows}
+
+        terminados_rows = (
+            scoped(HistorialEtapaContrato.objects.all(), self.request, 'contrato__tenant')
+            .filter(
                 etapa_nueva=EtapaContrato.TERMINADO,
-                fecha_cambio__date__gte=m_start,
-                fecha_cambio__date__lte=m_end,
-            ).values('contrato_id').distinct().count()
+                fecha_cambio__date__gte=ventana_inicio,
+                fecha_cambio__date__lte=ventana_fin,
+            )
+            .annotate(mes=TruncMonth('fecha_cambio'))
+            .values('mes').annotate(n=Count('contrato_id', distinct=True))
+        )
+        terminados_map = {(r['mes'].year, r['mes'].month): r['n'] for r in terminados_rows}
+
+        data = []
+        for anchor in meses:
+            key = (anchor.year, anchor.month)
             data.append({
                 'mes': _etiqueta_mes(anchor, today),
-                'iniciados': iniciados,
-                'terminados': terminados,
+                'iniciados': iniciados_map.get(key, 0),
+                'terminados': terminados_map.get(key, 0),
             })
         return data
 
     # ── Calendario de vencimientos (próximos 12 meses) ───────────────────────
     def _build_vencimientos(self, today):
-        data = []
-        for i in range(12):
-            anchor = _shift_months(today, i)
-            m_start, m_end = _month_bounds(anchor)
-            if i == 0:
-                m_start = today  # el mes en curso cuenta desde hoy
-            agg = self._contratos().filter(
+        # Antes: 1 aggregate por mes (12 queries). Ahora: 1 sola query agrupada
+        # con TruncMonth; el mes en curso ya arranca en `today` porque la
+        # ventana completa se filtra desde hoy (no desde el día 1 del mes).
+        meses = [_shift_months(today, i) for i in range(12)]
+        ventana_fin = _month_bounds(meses[-1])[1]
+
+        rows = (
+            self._contratos()
+            .filter(
                 status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA],
-                fecha_vencimiento__gte=m_start,
-                fecha_vencimiento__lte=m_end,
-            ).aggregate(n=Count('id'), monto=Sum('monto'))
+                fecha_vencimiento__gte=today,
+                fecha_vencimiento__lte=ventana_fin,
+            )
+            .annotate(mes=TruncMonth('fecha_vencimiento'))
+            .values('mes').annotate(n=Count('id'), monto=Sum('monto'))
+        )
+        by_month = {(r['mes'].year, r['mes'].month): r for r in rows}
+
+        data = []
+        for anchor in meses:
+            r = by_month.get((anchor.year, anchor.month))
             data.append({
                 'mes': _etiqueta_mes(anchor, today),
-                'count': agg['n'] or 0,
-                'monto': float(agg['monto'] or 0),
+                'count': r['n'] if r else 0,
+                'monto': float(r['monto'] or 0) if r else 0.0,
             })
         return data
 

@@ -1,7 +1,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.utils import timezone
-from django.db.models import Q
+from django.db.models import Count, Q
 from contratos.models import Contrato, EstadoContrato, EtapaContrato, ObligacionSLAAuditLog, HistorialEtapaContrato
 from clientes.models import Cliente
 from legal.models import LogAceptacion
@@ -14,33 +14,41 @@ class AuditoriaView(APIView):
     def get(self, request):
         today = timezone.localdate()
 
-        # 1. Fetch contracts to calculate KPIs
+        # 1. Fetch contracts to calculate KPIs — antes: 6 .count() separados sobre
+        # el mismo queryset (7 con non_standard_clauses_count), ahora 1 sola
+        # aggregate() con Count(filter=...) condicional por cada bucket.
         all_contracts = scoped(Contrato.objects.all(), request)
-        total_contracts = all_contracts.count()
-
-        # Calculations for KPIs
-        mora_suspended_count = all_contracts.filter(status__in=[EstadoContrato.MORA, EstadoContrato.SUSPENDIDO]).count()
+        counts = all_contracts.aggregate(
+            total=Count('id'),
+            mora_suspendido=Count('id', filter=Q(status__in=[EstadoContrato.MORA, EstadoContrato.SUSPENDIDO])),
+            pending_audits=Count('id', filter=Q(etapa__in=[EtapaContrato.REVISION, EtapaContrato.APROBADO])),
+            expired_active=Count('id', filter=Q(status=EstadoContrato.ACTIVO, fecha_vencimiento__lt=today)),
+            medium_risk=Count('id', filter=Q(etapa__in=[EtapaContrato.BORRADOR, EtapaContrato.REVISION, EtapaContrato.PENDIENTE_FIRMA])),
+            low_risk=Count('id', filter=(
+                Q(status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA, EstadoContrato.VENCIDO])
+                & ~Q(etapa__in=[EtapaContrato.BORRADOR, EtapaContrato.REVISION, EtapaContrato.PENDIENTE_FIRMA])
+            )),
+        )
+        total_contracts = counts['total']
+        mora_suspended_count = counts['mora_suspendido']
 
         # Non standard clauses: count of modifications in SLA obligations (EDITAR or ELIMINAR actions)
         non_standard_clauses_count = scoped(ObligacionSLAAuditLog.objects.all(), request, 'contrato__tenant') \
             .filter(accion__in=['EDITAR', 'ELIMINAR']).count()
-        
+
         # Pending audits: contracts in REVISION or APROBADO stage
-        pending_audits_count = all_contracts.filter(etapa__in=[EtapaContrato.REVISION, EtapaContrato.APROBADO]).count()
-        
+        pending_audits_count = counts['pending_audits']
+
         # Calculate Compliance Score
         # Base is 100.
         # Deduct 15 points per contract in MORA or SUSPENDIDO (max penalty 30)
         # Deduct 5 points per expired active contract (max penalty 20)
         # Minimum score is 50
-        expired_active_count = all_contracts.filter(
-            status=EstadoContrato.ACTIVO,
-            fecha_vencimiento__lt=today
-        ).count()
-        
+        expired_active_count = counts['expired_active']
+
         compliance_penalty = (mora_suspended_count * 15) + (expired_active_count * 5)
         compliance_score = max(50, 100 - compliance_penalty)
-        
+
         # If there are no contracts, baseline compliance is 100
         if total_contracts == 0:
             compliance_score = 100
@@ -59,9 +67,9 @@ class AuditoriaView(APIView):
         # Low risk: ACTIVE, GRACIA, VENCIDO, TERMINADO status + not Mora/Suspended
         # Medium risk: BORRADOR, REVISION, PENDIENTE_FIRMA stages
         # High risk: MORA, SUSPENDIDO status
-        high_risk_db = all_contracts.filter(status__in=[EstadoContrato.MORA, EstadoContrato.SUSPENDIDO]).count()
-        medium_risk_db = all_contracts.filter(etapa__in=[EtapaContrato.BORRADOR, EtapaContrato.REVISION, EtapaContrato.PENDIENTE_FIRMA]).count()
-        low_risk_db = all_contracts.filter(status__in=[EstadoContrato.ACTIVO, EstadoContrato.GRACIA, EstadoContrato.VENCIDO]).exclude(etapa__in=[EtapaContrato.BORRADOR, EtapaContrato.REVISION, EtapaContrato.PENDIENTE_FIRMA]).count()
+        high_risk_db = mora_suspended_count
+        medium_risk_db = counts['medium_risk']
+        low_risk_db = counts['low_risk']
 
         risk_distribution = [
             { 'name': 'Riesgo Bajo', 'value': low_risk_db, 'color': 'var(--success-alt)' },
@@ -123,14 +131,15 @@ class AuditoriaView(APIView):
             .select_related('contrato', 'usuario').order_by('-fecha_cambio')[:15]
         for st in stage_logs:
             user_name = st.usuario.username if st.usuario else "Sistema"
+            action_text = "Actualizó contrato" if st.etapa_anterior == st.etapa_nueva else f"Transicionó a {st.etapa_nueva.lower()}"
             logs.append({
                 'id': f"stage-{st.id}",
                 'user': user_name,
-                'action': f"Transicionó a {st.etapa_nueva.lower()}",
+                'action': action_text,
                 'target': f"Contrato #{st.contrato_id}",
                 'date': st.fecha_cambio.isoformat(),
                 'risk': 'low',
-                'details': st.notas or f"Cambio de etapa de {st.etapa_anterior} a {st.etapa_nueva}.",
+                'details': st.notas or (f"Cambio de etapa de {st.etapa_anterior} a {st.etapa_nueva}." if st.etapa_anterior != st.etapa_nueva else "Actualización general"),
                 'ip': 'N/A',
                 'session': 'WEB'
             })

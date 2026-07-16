@@ -14,9 +14,9 @@ class DocumentoLegal(models.Model):
     class Meta:
         db_table = 'legal_documentolegal'
         indexes = [
-            # Partial index cannot be created just with models.Index using a condition in older django, 
-            # but Django 3.2+ supports `condition=Q(is_vigente=True)`
-            models.Index(fields=['id'], condition=models.Q(is_vigente=True), name='idx_doc_legal_vigente'),
+            # Partial index sobre las columnas de búsqueda real (tenant+tipo vigente),
+            # no sobre 'id' (que Postgres ya indexa como PK y no acelera este filtro).
+            models.Index(fields=['tenant', 'tipo'], condition=models.Q(is_vigente=True), name='idx_doc_legal_vigente'),
         ]
 
 class LogAceptacion(models.Model):

@@ -67,6 +67,9 @@ class Producto(models.Model):
     class Meta:
         db_table = 'catalogo_producto'
         ordering = ['nombre']
+        indexes = [
+            models.Index(fields=['tenant', 'estado'], name='idx_producto_tenant_estado'),
+        ]
         constraints = [
             models.UniqueConstraint(fields=['tenant', 'sku'], name='uniq_producto_sku_por_tenant'),
         ]
