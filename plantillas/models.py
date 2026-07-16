@@ -29,6 +29,20 @@ class PlantillaDocumento(models.Model):
     )
     archivo_docx = models.FileField(upload_to='plantillas_contrato/%Y/%m/', null=True, blank=True)
     ruta_plantilla_html = models.CharField(max_length=255, blank=True, null=True, help_text="Ruta del archivo HTML en el backend (ej: plantillas_html/mi_plantilla.html)")
+    codigo_prefijo = models.CharField(
+        max_length=20, blank=True, null=True,
+        help_text="Prefijo del correlativo de 'Referencia' para documentos HTML generados con esta "
+                   "plantilla (ej: NDA, MSA, TOS, REQ). El sistema arma códigos únicos tipo "
+                   "PREFIJO-AÑO-NNN al generar el documento; se comparte entre plantillas con el "
+                   "mismo prefijo (misma familia de documento) y se resetea cada año."
+    )
+    requiere_sla_facturacion = models.BooleanField(
+        default=True,
+        help_text="Si está desmarcado, el wizard 'Nuevo Contrato' no pide SLA, facturación ni días "
+                   "de gracia para esta plantilla (documentos administrativos como NDA, memorándums "
+                   "o fichas de requerimientos, que no son un servicio con nivel de servicio ni cobro). "
+                   "Se les asigna un SLA técnico 'N/A' automáticamente."
+    )
     clausulas_seleccionadas = models.ManyToManyField('Clausula', blank=True, related_name='plantillas')
     version_codigo = models.CharField(max_length=32)
     activa = models.BooleanField(default=True)
@@ -90,6 +104,27 @@ class DocumentoGenerado(models.Model):
         return f"Documento contrato #{self.contrato_id} — {self.fecha_generacion:%Y-%m-%d %H:%M}"
 
 
+class SecuenciaReferencia(models.Model):
+    """Correlativo del código 'Referencia' de documentos HTML, por tenant + prefijo + año.
+    Un solo contador compartido entre todas las plantillas con el mismo codigo_prefijo
+    (misma familia de documento, ej. todos los NDA), reseteado cada año calendario."""
+    id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
+                               db_column='tenant_id', related_name='secuencias_referencia')
+    prefijo = models.CharField(max_length=20)
+    anio = models.IntegerField()
+    ultimo_numero = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'plantillas_secuenciareferencia'
+        constraints = [
+            models.UniqueConstraint(fields=['tenant', 'prefijo', 'anio'], name='uniq_secuencia_tenant_prefijo_anio'),
+        ]
+
+    def __str__(self):
+        return f"{self.prefijo}-{self.anio} (último: {self.ultimo_numero})"
+
+
 class Clausula(models.Model):
     id = models.BigAutoField(primary_key=True)
     tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
@@ -109,6 +144,9 @@ class Clausula(models.Model):
     class Meta:
         db_table = 'plantillas_clausula'
         ordering = ['categoria', 'nombre']
+        indexes = [
+            models.Index(fields=['tenant', 'activa'], name='idx_clausula_tenant_activa'),
+        ]
 
     def __str__(self):
         return f"{self.nombre} ({self.categoria})"

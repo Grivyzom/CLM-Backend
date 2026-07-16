@@ -241,10 +241,16 @@ def renderizar_docx(plantilla: PlantillaDocumento, contexto: dict, contrato=None
 
 
 def renderizar_html(plantilla: PlantillaDocumento, contexto: dict) -> bytes:
-    """Renderiza el código HTML con el contexto dado."""
-    from django.template.loader import render_to_string
+    """Renderiza la plantilla HTML con el contexto dado. Carga el archivo desde
+    DOCS_TEMPLATE_DIR (o templates/), adapta el formato dc de Claude Design a
+    página imprimible y evalúa las variables como template de Django."""
+    from django.template import engines
+    from .html_doc import cargar_plantilla_html, fecha_larga_es
     try:
-        html_str = render_to_string(plantilla.ruta_plantilla_html, contexto)
+        contexto = dict(contexto)
+        contexto.setdefault('fecha_documento', fecha_larga_es())
+        html_imprimible = cargar_plantilla_html(plantilla.ruta_plantilla_html)
+        html_str = engines['django'].from_string(html_imprimible).render(contexto)
         return html_str.encode('utf-8')
     except Exception as exc:
         raise PlantillaRenderError(f"Error al renderizar plantilla HTML '{plantilla.ruta_plantilla_html}': {exc}") from exc
@@ -318,12 +324,10 @@ def obtener_preview_pdf(plantilla: PlantillaDocumento) -> Path:
     if plantilla.modo_origen == ModoOrigenPlantilla.CLAUSULAS:
         entrada_bytes = construir_docx_desde_clausulas(plantilla).read()
     elif plantilla.modo_origen == ModoOrigenPlantilla.HTML:
-        from django.template.loader import render_to_string
         try:
-            html_str = render_to_string(plantilla.ruta_plantilla_html, {})
-            entrada_bytes = html_str.encode('utf-8')
+            entrada_bytes = renderizar_html(plantilla, {})
             es_html = True
-        except Exception as exc:
+        except PlantillaRenderError as exc:
             raise ConversionPDFError(f"Error al obtener preview de la plantilla HTML '{plantilla.ruta_plantilla_html}': {exc}")
     else:
         with plantilla.archivo_docx.open('rb') as f:
@@ -337,26 +341,47 @@ def obtener_preview_pdf(plantilla: PlantillaDocumento) -> Path:
 
     if not pdf_path.exists():
         if es_html:
-            pdf_bytes = convertir_con_libreoffice(entrada_bytes, 'html', 'pdf')
+            # WeasyPrint y no LibreOffice: respeta flexbox/grid/@page del diseño.
+            from .html_doc import html_a_pdf
+            pdf_bytes = html_a_pdf(entrada_bytes.decode('utf-8'))
         else:
             pdf_bytes = convertir_a_pdf(entrada_bytes)
         pdf_path.write_bytes(pdf_bytes)
     return pdf_path
 
 
-def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=None) -> DocumentoGenerado:
+def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=None,
+                      campos: dict = None) -> DocumentoGenerado:
     """Orquesta: resuelve plantilla si no viene dada, construye contexto,
     renderiza docx, convierte a PDF, calcula hash y crea el DocumentoGenerado
-    (write-once — nunca actualiza un registro existente)."""
+    (write-once — nunca actualiza un registro existente).
+
+    `campos`: valores manuales para las variables propias de la plantilla HTML
+    (ej. para/de/asunto de un memorándum). No pueden pisar los namespaces del
+    contrato; quedan auditados en contexto_usado."""
     if plantilla is None:
         plantilla = resolver_plantilla_activa(contrato.tipo_contrato, contrato.software_id, contrato.tenant)
 
     contexto = construir_contexto(contrato)
-    
+
+    if campos:
+        from .html_doc import VARIABLES_RESERVADAS
+        for clave, valor in campos.items():
+            if clave not in VARIABLES_RESERVADAS and str(valor).strip():
+                contexto[clave] = str(valor)
+
     if plantilla.modo_origen == ModoOrigenPlantilla.HTML:
+        from .html_doc import html_a_pdf, siguiente_referencia
+        # Correlativo de "Referencia" asignado por el sistema (nunca por el
+        # usuario ni por `campos`): se consume solo aquí, en generación real
+        # -- el preview de la plantilla (obtener_preview_pdf) no pasa por acá,
+        # así que no gasta números de la secuencia.
+        contexto['referencia'] = siguiente_referencia(contrato.tenant, plantilla.codigo_prefijo)
         html_bytes = renderizar_html(plantilla, contexto)
+        # PDF con WeasyPrint (diseño fiel: flexbox/grid/@page). El .docx interno
+        # sigue saliendo de LibreOffice, que es el único que escribe Word.
+        pdf_bytes = html_a_pdf(html_bytes.decode('utf-8'))
         docx_bytes = convertir_con_libreoffice(html_bytes, 'html', 'docx', 'docx:MS Word 2007 XML')
-        pdf_bytes = convertir_con_libreoffice(html_bytes, 'html', 'pdf')
     else:
         docx_bytes = renderizar_docx(plantilla, contexto, contrato)
         pdf_bytes = convertir_a_pdf(docx_bytes)

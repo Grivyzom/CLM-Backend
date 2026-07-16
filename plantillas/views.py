@@ -1,4 +1,4 @@
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.conf import settings
@@ -10,7 +10,7 @@ from rest_framework.exceptions import ValidationError as DRFValidationError
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 
-from contratos.models import Contrato, EtapaContrato
+from contratos.models import Contrato, EtapaContrato, TipoContrato
 from catalogo.models import Producto
 from tenants.permissions import DeleteRequiresTenantAdmin, IsTenantMember, RequiresFeature
 from tenants.scoping import resolve_tenant_for_write, scoped
@@ -20,6 +20,7 @@ from .services.renderizado import (
     generar_documento, resolver_plantilla_activa, obtener_preview_pdf,
     PlantillaRenderError, VariablesFaltantesError, SinPlantillaActivaError, ConversionPDFError,
 )
+from .services.html_doc import PlantillaHTMLNoEncontrada
 
 # Etapas en las que el contrato ya tiene un documento "vigente" — regenerar acá
 # requiere confirmación explícita (forzar=true) para no pisar silenciosamente
@@ -30,30 +31,65 @@ ETAPAS_CON_DOCUMENTO_EMITIDO = {
 }
 
 
-def _available_html_templates():
-    """Lista de rutas relativas bajo templates/plantillas_html/*.html.
+def _available_html_templates_info():
+    """Plantillas HTML ofrecidas como template en el CLM, con metadata de
+    nomenclatura: [{'ruta', 'nombre', 'tipo'}]. tipo=None => global.
 
     Única fuente de verdad para el dropdown del frontend (AvailableHtmlTemplatesView)
     y para validar server-side que `ruta_plantilla_html` no apunte a un template
-    Django fuera de esa carpeta (render_to_string resuelve contra todos los
-    directorios de templates del proyecto, no solo este)."""
+    fuera de las carpetas permitidas. Dos orígenes:
+    - DOCS_TEMPLATE_DIR (clm_frontend/public/docs_template): archivos .dc.html
+      exportados desde Claude Design (nomenclatura TIPO__Nombre.dc.html); el
+      motor los adapta a página imprimible.
+    - templates/plantillas_html/: templates Django planos legados (globales)."""
     import os
 
+    from .services.html_doc import listar_plantillas_docs_info
+
+    templates = listar_plantillas_docs_info()
+
     base_dir = Path(settings.BASE_DIR) / 'templates' / 'plantillas_html'
-    templates = []
     if base_dir.exists():
         for root, dirs, files in os.walk(base_dir):
             for f in files:
                 if f.endswith('.html'):
                     rel_path = os.path.relpath(os.path.join(root, f), base_dir)
                     rel_path = rel_path.replace('\\', '/')
-                    templates.append(f'plantillas_html/{rel_path}')
+                    templates.append({
+                        'ruta': f'plantillas_html/{rel_path}',
+                        'nombre': f,
+                        'tipo': None,
+                    })
     return templates
 
 
+def _available_html_templates():
+    """Rutas planas de plantillas HTML válidas (para validación server-side)."""
+    return [t['ruta'] for t in _available_html_templates_info()]
+
+
+def _validar_ruta_html_para_tipo(ruta: str, tipo_contrato: str):
+    """La ruta debe existir y su nomenclatura (si declara tipo) debe coincidir
+    con el tipo de contrato de la plantilla que se está creando/editando."""
+    info = next((t for t in _available_html_templates_info() if t['ruta'] == ruta), None)
+    if info is None:
+        raise DRFValidationError({'ruta_plantilla_html': 'Ruta de plantilla HTML no reconocida.'})
+    if info['tipo'] and tipo_contrato and info['tipo'] != tipo_contrato:
+        raise DRFValidationError({
+            'ruta_plantilla_html': (
+                f"La plantilla HTML '{info['nombre']}' es para tipo {info['tipo']} "
+                f"según su nomenclatura, pero esta plantilla es de tipo {tipo_contrato}."
+            )
+        })
+
+
 def _plantilla_a_dict(p: PlantillaDocumento):
-    from .models import DocumentoGenerado
-    usos = DocumentoGenerado.objects.filter(plantilla=p).count()
+    # 'usos' viene anotado (Count) cuando el caller lo precalculó en bulk (listado);
+    # si no, cae a una query individual (detalle/creación de una sola plantilla).
+    usos = getattr(p, 'usos', None)
+    if usos is None:
+        from .models import DocumentoGenerado
+        usos = DocumentoGenerado.objects.filter(plantilla=p).count()
     return {
         'id': p.id,
         'nombre': p.nombre,
@@ -67,8 +103,12 @@ def _plantilla_a_dict(p: PlantillaDocumento):
         'activa': p.activa,
         'fecha_creacion': p.fecha_creacion,
         'usos': usos,
-        'clausulas_seleccionadas': list(p.clausulas_seleccionadas.values_list('id', flat=True)),
+        # .all() en vez de .values_list(): cuando el caller usó prefetch_related
+        # (listado) esto lee de la caché ya cargada en vez de disparar otra query.
+        'clausulas_seleccionadas': [c.id for c in p.clausulas_seleccionadas.all()],
         'ruta_plantilla_html': p.ruta_plantilla_html if p.modo_origen == 'html' else None,
+        'codigo_prefijo': p.codigo_prefijo if p.modo_origen == 'html' else None,
+        'requiere_sla_facturacion': p.requiere_sla_facturacion,
     }
 
 
@@ -97,7 +137,15 @@ class PlantillaListCreateView(APIView):
     permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request):
-        qs = scoped(PlantillaDocumento.objects.all(), request).select_related('software')
+        # select_related('software') evita 1 query por fila para software_nombre;
+        # annotate(usos=...) + prefetch_related evita el N+1 que había en
+        # _plantilla_a_dict (antes: 2 queries extra por plantilla, sin paginar).
+        qs = (
+            scoped(PlantillaDocumento.objects.all(), request)
+            .select_related('software')
+            .annotate(usos=Count('documentogenerado', distinct=True))
+            .prefetch_related('clausulas_seleccionadas')
+        )
         tipo_contrato = request.GET.get('tipo_contrato')
         software_id = request.GET.get('software')
         activa = request.GET.get('activa')
@@ -135,6 +183,8 @@ class PlantillaListCreateView(APIView):
             errors['nombre'] = 'Este campo es requerido.'
         if not tipo_contrato:
             errors['tipo_contrato'] = 'Este campo es requerido.'
+        elif tipo_contrato not in TipoContrato.values:
+            errors['tipo_contrato'] = f'Tipo inválido. Opciones: {list(TipoContrato.values)}'
         if not version_codigo:
             errors['version_codigo'] = 'Este campo es requerido.'
         if not software_id:
@@ -157,8 +207,7 @@ class PlantillaListCreateView(APIView):
         elif modo_origen == ModoOrigenPlantilla.HTML:
             if not ruta_plantilla_html or not str(ruta_plantilla_html).strip():
                 raise DRFValidationError({'ruta_plantilla_html': 'Se requiere seleccionar una ruta de plantilla HTML.'})
-            if ruta_plantilla_html not in _available_html_templates():
-                raise DRFValidationError({'ruta_plantilla_html': 'Ruta de plantilla HTML no reconocida.'})
+            _validar_ruta_html_para_tipo(ruta_plantilla_html, tipo_contrato)
 
         tenant = resolve_tenant_for_write(request, request.data)
         if software_id and not Producto.objects.filter(pk=software_id, tenant=tenant).exists():
@@ -174,6 +223,9 @@ class PlantillaListCreateView(APIView):
             modo_origen=modo_origen,
             archivo_docx=archivo if modo_origen == ModoOrigenPlantilla.ARCHIVO else None,
             ruta_plantilla_html=ruta_plantilla_html if modo_origen == ModoOrigenPlantilla.HTML else None,
+            codigo_prefijo=(request.data.get('codigo_prefijo') or '').strip().upper()[:20] or None
+                if modo_origen == ModoOrigenPlantilla.HTML else None,
+            requiere_sla_facturacion=str(request.data.get('requiere_sla_facturacion', 'true')).lower() in ('1', 'true', 'si'),
             version_codigo=version_codigo,
             activa=activa,
             subida_por=request.user,
@@ -217,7 +269,10 @@ class PlantillaDetailView(APIView):
         if 'nombre' in request.data:
             plantilla.nombre = request.data.get('nombre')
         if 'tipo_contrato' in request.data:
-            plantilla.tipo_contrato = request.data.get('tipo_contrato')
+            nuevo_tipo = request.data.get('tipo_contrato')
+            if nuevo_tipo not in TipoContrato.values:
+                raise DRFValidationError({'tipo_contrato': f'Tipo inválido. Opciones: {list(TipoContrato.values)}'})
+            plantilla.tipo_contrato = nuevo_tipo
         if 'version_codigo' in request.data:
             plantilla.version_codigo = request.data.get('version_codigo')
         if 'software' in request.data:
@@ -240,9 +295,14 @@ class PlantillaDetailView(APIView):
             if plantilla.modo_origen == ModoOrigenPlantilla.HTML:
                 if not str(nueva_ruta).strip():
                     raise DRFValidationError({'ruta_plantilla_html': 'Se requiere seleccionar una ruta de plantilla HTML.'})
-                if nueva_ruta not in _available_html_templates():
-                    raise DRFValidationError({'ruta_plantilla_html': 'Ruta de plantilla HTML no reconocida.'})
+                _validar_ruta_html_para_tipo(nueva_ruta, plantilla.tipo_contrato)
             plantilla.ruta_plantilla_html = nueva_ruta
+
+        if 'codigo_prefijo' in request.data:
+            plantilla.codigo_prefijo = (request.data.get('codigo_prefijo') or '').strip().upper()[:20] or None
+
+        if 'requiere_sla_facturacion' in request.data:
+            plantilla.requiere_sla_facturacion = str(request.data.get('requiere_sla_facturacion')).lower() in ('1', 'true', 'si')
 
         clausulas_str = request.data.get('clausulas_seleccionadas')
         if clausulas_str is not None:
@@ -308,11 +368,64 @@ class PlantillaRegenerarPreviewView(APIView):
 
 
 class AvailableHtmlTemplatesView(APIView):
-    """GET /api/plantillas/html-templates/"""
+    """GET /api/plantillas/html-templates/?tipo_contrato=<TIPO>
+
+    Devuelve [{'ruta', 'nombre', 'tipo'}]. Con ?tipo_contrato= solo entrega las
+    plantillas de ese tipo (según nomenclatura TIPO__Nombre.dc.html) más las
+    globales (sin prefijo, tipo=null)."""
     permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request):
-        return Response(_available_html_templates())
+        tipo = request.GET.get('tipo_contrato')
+        items = _available_html_templates_info()
+        if tipo:
+            items = [t for t in items if t['tipo'] in (None, tipo)]
+        return Response(items)
+
+
+class CamposPlantillaView(APIView):
+    """GET /api/plantillas/documentos/campos/?plantilla_id=<id>
+       GET /api/plantillas/documentos/campos/?contrato_id=<id>[&plantilla_id=<id>]
+
+    Campos manuales que la plantilla HTML espera del usuario (para renderizar
+    el formulario previo a "Generar documento"). Si la plantilla resuelta no
+    es de modo HTML, devuelve lista vacía (docx/cláusulas no tienen este paso).
+
+    `plantilla_id` solo (sin contrato_id): consulta directa a una plantilla ya
+    elegida, útil en wizards donde el contrato aún no existe (UseTemplateModal,
+    NewContractModal). `contrato_id`: resuelve la plantilla activa de ese
+    contrato si no se especifica `plantilla_id`."""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request):
+        contrato_id = request.GET.get('contrato_id')
+        plantilla_id = request.GET.get('plantilla_id')
+        if not contrato_id and not plantilla_id:
+            raise DRFValidationError({'contrato_id': 'Se requiere contrato_id o plantilla_id.'})
+
+        if not contrato_id:
+            plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=plantilla_id)
+        else:
+            contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=contrato_id)
+            if plantilla_id:
+                plantilla = get_object_or_404(
+                    PlantillaDocumento.objects.filter(tenant=contrato.tenant), pk=plantilla_id,
+                )
+            else:
+                try:
+                    plantilla = resolver_plantilla_activa(contrato.tipo_contrato, contrato.software_id, contrato.tenant)
+                except SinPlantillaActivaError as exc:
+                    return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        if plantilla.modo_origen != ModoOrigenPlantilla.HTML:
+            return Response({'plantilla_id': plantilla.id, 'campos': []})
+
+        from .services.html_doc import extraer_campos_manuales
+        try:
+            campos = extraer_campos_manuales(plantilla.ruta_plantilla_html)
+        except PlantillaHTMLNoEncontrada as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response({'plantilla_id': plantilla.id, 'campos': campos})
 
 
 class DocumentoGeneradoListView(APIView):
@@ -364,8 +477,25 @@ class GenerarDocumentoView(APIView):
                 PlantillaDocumento.objects.filter(tenant=contrato.tenant), pk=plantilla_id,
             )
 
+        campos = request.data.get('campos') or {}
+        if not isinstance(campos, dict):
+            raise DRFValidationError({'campos': 'Debe ser un objeto {variable: valor}.'})
+        if len(campos) > 50:
+            raise DRFValidationError({'campos': 'Máximo 50 campos.'})
+        for clave, valor in campos.items():
+            if not isinstance(valor, str) or len(str(clave)) > 64 or len(valor) > 10000:
+                raise DRFValidationError({'campos': f"Valor inválido para '{clave}': solo texto (máx. 10.000 caracteres)."})
+
         try:
-            documento = generar_documento(contrato, plantilla=plantilla, usuario=request.user)
+            documento = generar_documento(contrato, plantilla=plantilla, usuario=request.user, campos=campos)
+            from contratos.models import HistorialEtapaContrato
+            HistorialEtapaContrato.objects.create(
+                contrato=contrato,
+                etapa_anterior=contrato.etapa,
+                etapa_nueva=contrato.etapa,
+                usuario=request.user,
+                notas="Actualización/Regeneración de documento PDF desde plantilla."
+            )
         except SinPlantillaActivaError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
         except VariablesFaltantesError as exc:
