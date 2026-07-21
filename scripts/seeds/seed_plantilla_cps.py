@@ -334,19 +334,55 @@ def build_docx() -> bytes:
     )
 
     # ══════════════════════════════════════════════════════════════════════════
-    # 12. RESOLUCIÓN DE DISPUTAS
+    # 12. RESOLUCIÓN DE DISPUTAS Y ESCALAMIENTO EJECUTIVO
     # ══════════════════════════════════════════════════════════════════════════
     _set_heading(doc, '12. RESOLUCIÓN DE DISPUTAS Y LEY APLICABLE')
     _add_body(doc,
-        'Las partes se comprometen a intentar resolver cualquier controversia de manera '
-        'amistosa en un plazo de 30 (treinta) días. De no alcanzarse acuerdo, la disputa '
-        'se someterá a mediación y, en su defecto, a arbitraje de derecho ante un árbitro '
-        'designado por el Centro de Arbitraje y Mediación correspondiente.')
+        'Previo al inicio de cualquier acción judicial o arbitral, toda controversia '
+        'deberá someterse a un proceso de escalamiento ejecutivo. Representantes '
+        'de nivel gerencial de ambas partes contarán con un plazo de quince (15) '
+        'días hábiles para reunirse y procurar una solución de buena fe. De no '
+        'alcanzarse acuerdo en un plazo total de 30 (treinta) días, la disputa '
+        'se someterá a mediación y, en su defecto, a la jurisdicción ordinaria o '
+        'arbitral correspondiente.')
 
     _add_body(doc,
         'Este Contrato se rige por las leyes vigentes de la República de Chile. '
         'Para todos los efectos legales, las partes fijan su domicilio en la ciudad '
         'de Santiago.')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 13. USO DE INTELIGENCIA ARTIFICIAL Y DATOS
+    # ══════════════════════════════════════════════════════════════════════════
+    _set_heading(doc, '13. USO DE INTELIGENCIA ARTIFICIAL Y DATOS')
+    _add_body(doc,
+        'El Cliente reconoce que la Plataforma puede incluir funcionalidades basadas en '
+        'Inteligencia Artificial (IA). El Proveedor podrá utilizar datos anonimizados y '
+        'agregados para entrenar y mejorar sus algoritmos, sin utilizar datos personales '
+        'para modelos públicos. El Cliente conserva la titularidad sobre los resultados '
+        '("outputs") generados, pero el Proveedor no garantiza su absoluta precisión, '
+        'los cuales se proveen "tal cual" (AS-IS).')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 14. INTEGRACIÓN CON SERVICIOS DE TERCEROS
+    # ══════════════════════════════════════════════════════════════════════════
+    _set_heading(doc, '14. INTEGRACIÓN CON SERVICIOS DE TERCEROS')
+    _add_body(doc,
+        'Si el Cliente se integra con APIs o servicios de terceros (ej. CRMs o '
+        'pasarelas de pago), el Proveedor no garantiza la disponibilidad continua '
+        'de dichas integraciones. El Proveedor se exime de toda responsabilidad por '
+        'fallas, brechas de seguridad o pérdida de datos que ocurran dentro de la '
+        'infraestructura de dichos terceros.')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 15. CUMPLIMIENTO Y SANCIONES INTERNACIONALES
+    # ══════════════════════════════════════════════════════════════════════════
+    _set_heading(doc, '15. CUMPLIMIENTO Y SANCIONES INTERNACIONALES')
+    _add_body(doc,
+        'El Cliente declara que no se encuentra en listas de entidades sancionadas '
+        '(ej. OFAC, ONU) y se obliga a no usar la Plataforma en países sujetos a '
+        'embargos. La infracción de esta cláusula facultará al Proveedor para suspender '
+        'el servicio y terminar el contrato de inmediato sin indemnización.')
 
     # ══════════════════════════════════════════════════════════════════════════
     # FIRMAS
@@ -396,7 +432,11 @@ def seed():
 
     docx_bytes = build_docx()
 
+    from tenants.models import Tenant
+    tenant = Tenant.objects.first()
+    
     plantilla = PlantillaDocumento(
+        tenant=tenant,
         nombre=NOMBRE_PLANTILLA,
         tipo_contrato=TIPO_CONTRATO,
         software=None,       # Global → aplica a todos los tenants/softwares

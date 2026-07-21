@@ -3,6 +3,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db.models import Q, Sum, Count, Case, When, F, DecimalField
+from django.db.models.deletion import ProtectedError, RestrictedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.views import APIView
@@ -16,9 +17,13 @@ from plantillas.models import DocumentoGenerado
 from .models import (
     Contrato, EstadoContrato, TipoContrato, FrecuenciaFacturacion,
     EtapaContrato, SLA, HistorialEtapaContrato, ArchivoAdjunto,
-    ObligacionSLA, ObligacionSLAAuditLog,
+    ObligacionSLA, ObligacionSLAAuditLog, TokenFirmaContrato, ComentarioContrato
 )
+from .services import FirmaElectronicaError, confirmar_firma_electronica, enviar_firma_electronica
 from django.core.exceptions import ValidationError
+from django.http import JsonResponse, HttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
 from tenants.permissions import DeleteRequiresTenantAdmin, EditRequiresPermiso, IsPlatformClienteAccess, IsTenantMember, RequiresFeature
 from tenants.scoping import enforce_quota, resolve_tenant_for_write, scoped
 
@@ -490,6 +495,147 @@ def _parse_fecha_iso(valor):
         return None
 
 
+MAX_BLOQUES_CLAUSULAS = 200
+MAX_TITULO_BLOQUE = 300
+MAX_TEXTO_BLOQUE = 20000
+MAX_PROFUNDIDAD_CONTENIDO = 6
+MAX_NODOS_CONTENIDO = 500
+MAX_JSON_CONTENIDO_BLOQUE = 40000
+
+NODOS_PERMITIDOS = {'doc', 'paragraph', 'text', 'bulletList', 'orderedList', 'listItem', 'hardBreak'}
+MARCAS_PERMITIDAS = {'bold', 'italic', 'underline'}
+
+
+def _validar_contenido_rico(nodo, profundidad=0, contador=None):
+    if contador is None:
+        contador = [0]
+    contador[0] += 1
+    if contador[0] > MAX_NODOS_CONTENIDO:
+        raise DRFValidationError({'clausulas_estructuradas': 'Contenido de bloque demasiado extenso.'})
+    if profundidad > MAX_PROFUNDIDAD_CONTENIDO:
+        raise DRFValidationError({'clausulas_estructuradas': 'Contenido de bloque demasiado anidado.'})
+
+    if not isinstance(nodo, dict) or nodo.get('type') not in NODOS_PERMITIDOS:
+        tipo = nodo.get('type') if isinstance(nodo, dict) else type(nodo).__name__
+        raise DRFValidationError({'clausulas_estructuradas': f'Tipo de contenido no permitido: {tipo}'})
+
+    if nodo.get('type') == 'text':
+        marcas = {m.get('type') for m in (nodo.get('marks') or []) if isinstance(m, dict)}
+        no_permitidas = marcas - MARCAS_PERMITIDAS
+        if no_permitidas:
+            raise DRFValidationError({'clausulas_estructuradas': f'Marca de formato no permitida: {no_permitidas}'})
+
+    for hijo in nodo.get('content') or []:
+        _validar_contenido_rico(hijo, profundidad + 1, contador)
+
+
+def _numerar_bloques(bloques):
+    """Calcula numeración jerárquica (1.`, `1.1`, `a)`) para lista plana de bloques.
+    Devuelve lista de (numero, nivel) tuples."""
+    if not bloques:
+        return []
+    import json
+    contadores = [0, 0, 0]
+    numeros = []
+    for b in bloques:
+        nivel = max(0, min(2, int(b.get('nivel') or 0)))
+        contadores[nivel] += 1
+        for l in range(nivel + 1, 3):
+            contadores[l] = 0
+        if nivel == 0:
+            numero = f"{contadores[0]}."
+        elif nivel == 1:
+            numero = f"{contadores[0]}.{contadores[1]}"
+        else:
+            numero = f"{chr(ord('a') + contadores[2] - 1)})"
+        numeros.append((numero, nivel))
+    return numeros
+
+
+def _validar_clausulas_estructuradas(valor):
+    """Valida y sanea la lista de bloques del editor de cláusulas.
+    Devuelve una lista de dicts reconstruidos (solo claves conocidas) o None
+    si el valor es None/lista vacía. Lanza DRFValidationError si es inválido."""
+    if valor in (None, [], ''):
+        return None
+    if not isinstance(valor, list):
+        raise DRFValidationError({'clausulas_estructuradas': 'Debe ser una lista de bloques.'})
+    if len(valor) > MAX_BLOQUES_CLAUSULAS:
+        raise DRFValidationError({'clausulas_estructuradas': f'Máximo {MAX_BLOQUES_CLAUSULAS} bloques.'})
+
+    import json
+    bloques = []
+    for i, b in enumerate(valor):
+        if not isinstance(b, dict):
+            raise DRFValidationError({'clausulas_estructuradas': f'El bloque {i + 1} no es un objeto válido.'})
+        titulo = str(b.get('titulo') or '').strip()
+        texto = str(b.get('texto') or '').strip()
+        if not titulo and not texto:
+            continue
+        if len(titulo) > MAX_TITULO_BLOQUE:
+            raise DRFValidationError({'clausulas_estructuradas': f'Título del bloque {i + 1} demasiado largo.'})
+        if len(texto) > MAX_TEXTO_BLOQUE:
+            raise DRFValidationError({'clausulas_estructuradas': f'Texto del bloque {i + 1} demasiado largo.'})
+
+        bloque = {
+            'titulo': titulo,
+            'texto': texto,
+            'origen': b.get('origen') if b.get('origen') in ('biblioteca', 'personalizada') else 'personalizada',
+            'modificada': bool(b.get('modificada')),
+        }
+
+        nivel = b.get('nivel')
+        if nivel is not None:
+            try:
+                nivel = int(nivel)
+                bloque['nivel'] = max(0, min(2, nivel))
+            except (TypeError, ValueError):
+                pass
+
+        contenido = b.get('contenido')
+        if contenido is not None and isinstance(contenido, (list, dict)):
+            try:
+                json_str = json.dumps(contenido)
+                if len(json_str) > MAX_JSON_CONTENIDO_BLOQUE:
+                    raise DRFValidationError({'clausulas_estructuradas': f'Contenido del bloque {i + 1} demasiado grande.'})
+                if isinstance(contenido, dict):
+                    _validar_contenido_rico(contenido)
+                elif isinstance(contenido, list):
+                    for nodo in contenido:
+                        _validar_contenido_rico(nodo)
+                bloque['contenido'] = contenido
+            except DRFValidationError:
+                raise
+            except Exception as e:
+                raise DRFValidationError({'clausulas_estructuradas': f'Error validando contenido rico del bloque {i + 1}: {str(e)}'})
+
+        for clave in ('clausula_id', 'version_id'):
+            try:
+                if b.get(clave) is not None:
+                    bloque[clave] = int(b[clave])
+            except (TypeError, ValueError):
+                pass
+
+        bloques.append(bloque)
+    return bloques or None
+
+
+def _texto_desde_bloques(bloques):
+    """Serializa los bloques a texto plano numerado con numeración jerárquica."""
+    if not bloques:
+        return None
+    numeros_y_niveles = _numerar_bloques(bloques)
+    partes = []
+    for (numero, nivel), b in zip(numeros_y_niveles, bloques):
+        titulo = b.get('titulo') or ''
+        texto = b.get('texto') or ''
+        if titulo:
+            partes.append(f"{numero} {titulo.upper()}\n{texto}".strip())
+        else:
+            partes.append(texto)
+    return '\n\n'.join(partes)
+
+
 def _dias_restantes(fecha_vencimiento, today):
     if not fecha_vencimiento:
         return None
@@ -728,6 +874,11 @@ class ContratoListCreateView(APIView):
         if errors:
             raise DRFValidationError(errors)
 
+        # Bloques del editor de cláusulas (wizard). El texto plano se deriva de
+        # los bloques si vienen; si no, se respeta el texto enviado tal cual.
+        clausulas_estructuradas = _validar_clausulas_estructuradas(data.get('clausulas_estructuradas'))
+        texto_adicional = _texto_desde_bloques(clausulas_estructuradas) or (data.get('texto_adicional_clausulas') or None)
+
         tenant = resolve_tenant_for_write(request, data)
         enforce_quota(tenant, 'contratos')
 
@@ -755,6 +906,8 @@ class ContratoListCreateView(APIView):
                     fecha_inicio=fecha_inicio,
                     fecha_vencimiento=fecha_vencimiento,
                     dias_gracia_autorizados=dias_gracia,
+                    clausulas_estructuradas=clausulas_estructuradas,
+                    texto_adicional_clausulas=texto_adicional,
                 )
 
                 # Seed default obligations
@@ -807,8 +960,8 @@ def _contrato_detail_dict(c):
     documentos = [
         {
             'id': d.id,
-            'plantilla_version': d.plantilla.version_codigo,
-            'plantilla_nombre': d.plantilla.nombre,
+            'plantilla_version': d.plantilla.version_codigo if d.plantilla_id else 'N/A',
+            'plantilla_nombre': d.plantilla.nombre if d.plantilla_id else 'Eliminada',
             'hash_sha256': d.hash_sha256,
             'fecha_generacion': d.fecha_generacion,
         }
@@ -917,6 +1070,8 @@ def _contrato_detail_dict(c):
         'versiones': versiones,
         'plantilla_activa': plantilla_activa_info,
         'texto_adicional_clausulas': c.texto_adicional_clausulas,
+        'clausulas_estructuradas': c.clausulas_estructuradas,
+        'clausulas_actualizado_en': c.clausulas_actualizado_en,
         'external_editor': c.external_editor,
         'external_doc_id': c.external_doc_id,
         'external_sync_status': c.external_sync_status,
@@ -930,6 +1085,23 @@ def _contrato_detail_dict(c):
         'firma_fecha_firma': c.firma_fecha_firma,
         'firma_documento_firmado_url': c.firma_documento_firmado.url if c.firma_documento_firmado else None,
     }
+
+
+def _forzar_borrado_cascada(obj, _profundidad=0):
+    """Borra `obj`, y si algo lo protege (on_delete=PROTECT/RESTRICT), borra
+    primero esos bloqueadores de forma recursiva. Solo debe invocarse sobre
+    subárboles que ya se decidió descartar por completo (ej. un Contrato en
+    Borrador) — ProtectedError/RestrictedError son la señal de "esto es
+    legalmente inmutable" en otros contextos, y aquí se resuelven a propósito."""
+    if _profundidad > 10:
+        raise RuntimeError(f'Cascada de borrado demasiado profunda al intentar eliminar {obj!r}')
+    try:
+        obj.delete()
+    except (ProtectedError, RestrictedError) as e:
+        bloqueadores = list(getattr(e, 'protected_objects', None) or getattr(e, 'restricted_objects', None) or [])
+        for b in bloqueadores:
+            _forzar_borrado_cascada(b, _profundidad + 1)
+        obj.delete()
 
 
 class ContratoDetailView(APIView):
@@ -979,8 +1151,31 @@ class ContratoDetailView(APIView):
         dirty = False
         for campo in campo_simple:
             if campo in data:
-                setattr(c, campo, data[campo])
+                valor = data[campo]
+                # El monto llega como string/float desde JSON; sin normalizar,
+                # _compute_mrr_arr revienta al operar contra Decimal.
+                if campo == 'monto' and valor not in (None, ''):
+                    try:
+                        valor = Decimal(str(valor))
+                    except InvalidOperation:
+                        raise DRFValidationError({'monto': 'Monto inválido.'})
+                    if valor < 0:
+                        raise DRFValidationError({'monto': 'El monto no puede ser negativo.'})
+                setattr(c, campo, valor)
                 dirty = True
+        # Texto plano editado a mano (sin bloques) invalida la estructura previa:
+        # el render prioriza clausulas_estructuradas y taparía este texto.
+        if 'texto_adicional_clausulas' in data and 'clausulas_estructuradas' not in data:
+            c.clausulas_estructuradas = None
+            c.clausulas_actualizado_en = timezone.now()
+            dirty = True
+        if 'clausulas_estructuradas' in data:
+            bloques = _validar_clausulas_estructuradas(data['clausulas_estructuradas'])
+            c.clausulas_estructuradas = bloques
+            # El texto plano se mantiene como espejo de los bloques (compat sync externo).
+            c.texto_adicional_clausulas = _texto_desde_bloques(bloques)
+            c.clausulas_actualizado_en = timezone.now()
+            dirty = True
         if dirty:
             c.save()
             from .models import HistorialEtapaContrato
@@ -995,13 +1190,29 @@ class ContratoDetailView(APIView):
         return Response(_contrato_detail_dict(c))
 
     def delete(self, request, pk):
+        from django.db import transaction
+
         c = get_object_or_404(scoped(Contrato.objects.all(), request), pk=pk)
         if c.etapa != EtapaContrato.BORRADOR:
             return Response(
                 {'error': 'Solo se pueden eliminar contratos en etapa Borrador.'},
                 status=http_status.HTTP_400_BAD_REQUEST,
             )
-        c.delete()
+        # La inmutabilidad de DocumentoGenerado/Requerimiento/RegistroPerdonazo
+        # (on_delete=PROTECT/RESTRICT), y la de sus propios hijos protegidos
+        # (ej. RequerimientoGenerado), es una garantía de auditoría legal para
+        # contratos que llegaron a firmarse o activarse. Un contrato en Borrador
+        # nunca pasó por ahí, así que todo lo que cuelga de él se puede borrar en
+        # cascada junto con él. El chequeo de etapa de arriba es lo que acota
+        # este cascade solo a Borrador; no debe quitarse.
+        try:
+            with transaction.atomic():
+                _forzar_borrado_cascada(c)
+        except (ProtectedError, RestrictedError):
+            return Response(
+                {'error': 'No se puede eliminar: quedaron registros asociados que no se pudieron resolver automáticamente.'},
+                status=http_status.HTTP_400_BAD_REQUEST,
+            )
         return Response(status=http_status.HTTP_204_NO_CONTENT)
 
 
@@ -1334,6 +1545,10 @@ class ContratoExternalSyncView(APIView):
         elif action == 'sync_push':
             if content is not None:
                 contrato.texto_adicional_clausulas = content
+                # La edición externa pisa la estructura del editor de cláusulas:
+                # si quedara, el render la priorizaría e ignoraría este texto.
+                contrato.clausulas_estructuradas = None
+                contrato.clausulas_actualizado_en = timezone.now()
                 contrato.external_last_sync = timezone.now()
                 contrato.external_sync_status = 'SYNCED'
                 contrato.save()
@@ -1375,25 +1590,38 @@ class ContratoFirmaElectronicaView(APIView):
             if not proveedor or proveedor not in ['OTP', 'DOCUSIGN', 'ADOBE']:
                 return Response({'error': 'Proveedor de firma inválido o no especificado.'}, status=http_status.HTTP_400_BAD_REQUEST)
 
-            contrato.firma_proveedor = proveedor
-            contrato.firma_status = 'PENDING'
-            contrato.firma_envelope_id = str(uuid.uuid4())
-            contrato.firma_fecha_envio = timezone.now()
-
-            # Transicionar etapa del contrato a PENDIENTE_FIRMA si no estaba
-            if contrato.etapa != EtapaContrato.PENDIENTE_FIRMA:
-                contrato.transicionar_etapa(EtapaContrato.PENDIENTE_FIRMA, usuario=request.user, notas=f"Enviado para firma electrónica vía {proveedor}")
+            if proveedor == 'OTP':
+                # Flujo real: magic-link por correo al cliente + Certificado de
+                # Firma anexado al confirmar (ver .services.enviar_firma_electronica).
+                # DOCUSIGN/ADOBE no tienen integración real -> siguen mockeados abajo.
+                try:
+                    enviar_firma_electronica(contrato, usuario=request.user)
+                except FirmaElectronicaError as exc:
+                    return Response({'error': str(exc)}, status=http_status.HTTP_400_BAD_REQUEST)
+                contrato.refresh_from_db()
             else:
-                contrato.save()
-                HistorialEtapaContrato.objects.create(
-                    contrato=contrato,
-                    etapa_anterior=contrato.etapa,
-                    etapa_nueva=contrato.etapa,
-                    usuario=request.user,
-                    notas=f"Sobre de firma electrónica reiniciado vía {proveedor} (Envelope ID: {contrato.firma_envelope_id})"
-                )
+                contrato.firma_proveedor = proveedor
+                contrato.firma_status = 'PENDING'
+                contrato.firma_envelope_id = str(uuid.uuid4())
+                contrato.firma_fecha_envio = timezone.now()
+
+                # Transicionar etapa del contrato a PENDIENTE_FIRMA si no estaba
+                if contrato.etapa != EtapaContrato.PENDIENTE_FIRMA:
+                    contrato.transicionar_etapa(EtapaContrato.PENDIENTE_FIRMA, usuario=request.user, notas=f"Enviado para firma electrónica vía {proveedor}")
+                else:
+                    contrato.save()
+                    HistorialEtapaContrato.objects.create(
+                        contrato=contrato,
+                        etapa_anterior=contrato.etapa,
+                        etapa_nueva=contrato.etapa,
+                        usuario=request.user,
+                        notas=f"Sobre de firma electrónica reiniciado vía {proveedor} (Envelope ID: {contrato.firma_envelope_id})"
+                    )
 
         elif action == 'sign':
+            if contrato.firma_proveedor == 'OTP':
+                return Response({'error': 'La firma OTP se confirma por el enlace enviado al correo del cliente, no desde este panel.'}, status=http_status.HTTP_400_BAD_REQUEST)
+
             if contrato.firma_status != 'PENDING':
                 return Response({'error': 'No se puede firmar un contrato que no está pendiente de firma.'}, status=http_status.HTTP_400_BAD_REQUEST)
 
@@ -1451,3 +1679,95 @@ class ContratoFirmaElectronicaView(APIView):
             return Response({'error': 'Acción inválida.'}, status=http_status.HTTP_400_BAD_REQUEST)
 
         return Response(_contrato_detail_dict(contrato))
+
+
+# ---------------------------------------------------------------------------
+# Magic-link público de firma electrónica OTP (sin autenticación: lo visita
+# el cliente/contraparte externa desde el correo, no un usuario del CLM).
+# Vistas de función csrf_exempt, no APIView -- el default de DRF en este
+# proyecto es IsAuthenticated (ver REST_FRAMEWORK en settings.py), que
+# bloquearía a un visitante anónimo.
+# ---------------------------------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def api_firma_token_info(request, token):
+    tok = TokenFirmaContrato.objects.select_related('contrato', 'contrato__cliente').filter(token=token).first()
+    if tok is None or not tok.vigente():
+        return JsonResponse({'error': 'El enlace de firma es inválido o ya expiró.'}, status=400)
+
+    contrato = tok.contrato
+    return JsonResponse({
+        'contrato_nombre': contrato.nombre or f"Contrato #{contrato.id}",
+        'cliente_nombre': str(contrato.cliente),
+        'fecha_envio': contrato.firma_fecha_envio,
+    })
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_firma_token_confirmar(request, token):
+    try:
+        pdf_bytes = confirmar_firma_electronica(token, request)
+    except FirmaElectronicaError as exc:
+        return JsonResponse({'error': str(exc)}, status=400)
+
+    response = HttpResponse(pdf_bytes, content_type='application/pdf')
+    response['Content-Disposition'] = 'attachment; filename="certificado_firma.pdf"'
+    return response
+
+
+class ComentarioListCreateView(APIView):
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
+
+    def get(self, request, contrato_id):
+        # Verify access to the contract
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=contrato_id)
+        comentarios = ComentarioContrato.objects.filter(contrato=contrato).select_related('usuario')
+        data = [{
+            'id': c.id,
+            'texto': c.texto,
+            'tipo': c.tipo,
+            'fecha_creacion': c.fecha_creacion,
+            'usuario': c.usuario.get_full_name() or c.usuario.username if c.usuario else 'Desconocido',
+            'usuario_id': c.usuario.id if c.usuario else None
+        } for c in comentarios]
+        return Response(data)
+
+    def post(self, request, contrato_id):
+        contrato = get_object_or_404(scoped(Contrato.objects.all(), request), pk=contrato_id)
+        texto = request.data.get('texto', '').strip()
+        tipo = request.data.get('tipo', 'SUGERENCIA')
+        
+        if not texto:
+            raise DRFValidationError("El texto del comentario no puede estar vacío.")
+        
+        comentario = ComentarioContrato.objects.create(
+            contrato=contrato,
+            usuario=request.user,
+            texto=texto,
+            tipo=tipo
+        )
+        return Response({
+            'id': comentario.id,
+            'texto': comentario.texto,
+            'tipo': comentario.tipo,
+            'fecha_creacion': comentario.fecha_creacion,
+            'usuario': comentario.usuario.get_full_name() or comentario.usuario.username,
+            'usuario_id': comentario.usuario.id
+        }, status=http_status.HTTP_201_CREATED)
+
+
+class ComentarioDetailView(APIView):
+    permission_classes = [IsTenantMember, RequiresFeature('contratos')]
+    
+    def delete(self, request, pk):
+        comentario = get_object_or_404(ComentarioContrato, pk=pk)
+        # Check tenant access via contrato
+        get_object_or_404(scoped(Contrato.objects.all(), request), pk=comentario.contrato_id)
+        
+        if comentario.usuario_id != request.user.id and not request.user.is_superuser:
+            raise DRFValidationError("No puedes eliminar un comentario que no es tuyo.")
+            
+        comentario.delete()
+        return Response(status=http_status.HTTP_204_NO_CONTENT)

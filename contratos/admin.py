@@ -1,6 +1,6 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.utils.html import format_html
-from .models import SLA, Contrato, RegistroPerdonazo, HistorialEtapaContrato
+from .models import SLA, Contrato, RegistroPerdonazo, HistorialEtapaContrato, HitoContrato
 
 
 @admin.register(SLA)
@@ -21,12 +21,18 @@ class HistorialEtapaInline(admin.TabularInline):
     def has_add_permission(self, request, obj=None):
         return False
 
+class HitoContratoInline(admin.TabularInline):
+    model = HitoContrato
+    extra = 1
+    fields = ('descripcion', 'fecha_esperada', 'fecha_completada', 'estado', 'responsable', 'dias_aviso_previo', 'alerta_enviada')
+
 @admin.register(Contrato)
 class ContratoAdmin(admin.ModelAdmin):
     list_display = ('id', 'cliente', 'software', 'tipo_contrato', 'etapa', 'semaforo_estado', 'dias_restantes_display', 'monto')
     list_filter = ('etapa', 'status', 'tipo_contrato', 'software')
     search_fields = ('cliente__email_principal',)
-    inlines = [HistorialEtapaInline, PerdonazoInline]
+    inlines = [HistorialEtapaInline, PerdonazoInline, HitoContratoInline]
+    actions = ['extraer_hitos_automaticamente']
     
     # Define qué campos agrupar visualmente al editar un contrato
     fieldsets = (
@@ -85,3 +91,45 @@ class ContratoAdmin(admin.ModelAdmin):
             return format_html('<span style="color: red; font-weight: bold;">{} días</span>', dias)
         return dias
     dias_restantes_display.short_description = 'Tiempo Restante'
+
+    @admin.action(description="Extraer Hitos (Milestones) del texto del contrato")
+    def extraer_hitos_automaticamente(self, request, queryset):
+        import re
+        from datetime import datetime, date
+        
+        count = 0
+        for contrato in queryset:
+            texto = contrato.texto_adicional_clausulas or ""
+            # Simulación básica de extracción con expresiones regulares buscando DD/MM/YYYY
+            # En un entorno real se usaría IA (ej. legal/services.py con LLM)
+            fechas_encontradas = re.finditer(r'(entregable|pago|fase|hito|entrega)[\w\s]{0,50}?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})', texto, re.IGNORECASE)
+            
+            for match in fechas_encontradas:
+                descripcion_base = match.group(1).capitalize()
+                fecha_str = match.group(2)
+                
+                # Parsear fecha
+                try:
+                    if '/' in fecha_str:
+                        dia, mes, ano = map(int, fecha_str.split('/'))
+                    else:
+                        dia, mes, ano = map(int, fecha_str.split('-'))
+                    
+                    if ano < 100: 
+                        ano += 2000
+                    
+                    fecha_obj = date(ano, mes, dia)
+                    
+                    # Evitar duplicados
+                    if not HitoContrato.objects.filter(contrato=contrato, fecha_esperada=fecha_obj, descripcion__icontains=descripcion_base).exists():
+                        HitoContrato.objects.create(
+                            contrato=contrato,
+                            descripcion=f"{descripcion_base} (Extraído auto)",
+                            fecha_esperada=fecha_obj,
+                            responsable=request.user
+                        )
+                        count += 1
+                except ValueError:
+                    continue
+                    
+        self.message_user(request, f"Se han extraído y generado {count} hitos a partir de los contratos seleccionados.", messages.SUCCESS)

@@ -30,11 +30,11 @@ class PlantillaDocumento(models.Model):
     archivo_docx = models.FileField(upload_to='plantillas_contrato/%Y/%m/', null=True, blank=True)
     ruta_plantilla_html = models.CharField(max_length=255, blank=True, null=True, help_text="Ruta del archivo HTML en el backend (ej: plantillas_html/mi_plantilla.html)")
     codigo_prefijo = models.CharField(
-        max_length=20, blank=True, null=True,
-        help_text="Prefijo del correlativo de 'Referencia' para documentos HTML generados con esta "
-                   "plantilla (ej: NDA, MSA, TOS, REQ). El sistema arma códigos únicos tipo "
-                   "PREFIJO-AÑO-NNN al generar el documento; se comparte entre plantillas con el "
-                   "mismo prefijo (misma familia de documento) y se resetea cada año."
+        max_length=20,
+        help_text="Identificador de familia de documento (ej: NDA, MSA, TOS, REQ), compartido por "
+                   "todas las versiones del mismo documento sin importar el modo de generación. "
+                   "Agrupa las versiones en el catálogo y, para plantillas HTML, arma el correlativo "
+                   "de 'Referencia' como PREFIJO-AÑO-NNN al generar el documento."
     )
     requiere_sla_facturacion = models.BooleanField(
         default=True,
@@ -45,7 +45,14 @@ class PlantillaDocumento(models.Model):
     )
     clausulas_seleccionadas = models.ManyToManyField('Clausula', blank=True, related_name='plantillas')
     version_codigo = models.CharField(max_length=32)
+    portada = models.ImageField(upload_to='plantillas_portadas/%Y/%m/', null=True, blank=True, help_text="Imagen de la primera página (portada) de la plantilla")
     activa = models.BooleanField(default=True)
+    confirmada = models.BooleanField(
+        default=False,
+        help_text="False = borrador: la plantilla aún no se publicó, puede editarse y eliminarse "
+                   "libremente y no aparece al crear contratos. Activarla la confirma (transición "
+                   "de una sola vía); una plantilla confirmada ya no se elimina, solo se archiva."
+    )
     fecha_creacion = models.DateTimeField(auto_now_add=True)
     subida_por = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
                                     null=True, blank=True, db_column='subida_por_id')
@@ -63,6 +70,8 @@ class PlantillaDocumento(models.Model):
     def save(self, *args, **kwargs):
         with transaction.atomic():
             if self.activa:
+                # Activar es la transición borrador → confirmada (una sola vía).
+                self.confirmada = True
                 # Solo puede haber una plantilla activa por (tipo_contrato, software).
                 # Enforcement a nivel de aplicación, no constraint de BD: un índice único
                 # parcial con FK nullable no serviría porque Postgres trata cada NULL
@@ -84,7 +93,7 @@ class DocumentoGenerado(models.Model):
     id = models.BigAutoField(primary_key=True)
     contrato = models.ForeignKey('contratos.Contrato', on_delete=models.PROTECT, db_column='contrato_id',
                                   related_name='documentos_generados')
-    plantilla = models.ForeignKey(PlantillaDocumento, on_delete=models.PROTECT, db_column='plantilla_id')
+    plantilla = models.ForeignKey(PlantillaDocumento, on_delete=models.SET_NULL, null=True, db_column='plantilla_id')
     archivo_docx = models.FileField(upload_to='contratos_generados/docx/%Y/%m/%d/', editable=False)
     archivo_pdf = models.FileField(upload_to='contratos_generados/pdf/%Y/%m/%d/', editable=False)
     hash_sha256 = models.CharField(max_length=64, editable=False)
@@ -125,12 +134,33 @@ class SecuenciaReferencia(models.Model):
         return f"{self.prefijo}-{self.anio} (último: {self.ultimo_numero})"
 
 
+class TipoTextoClausula(models.TextChoices):
+    """Clasifica cada texto de la biblioteca según su función dentro del documento.
+    CLAUSULA es el cuerpo legal tradicional; el resto son textos de apoyo
+    (saludos, introducciones, despedidas, cierres, bloques de firma) que permiten
+    armar un documento completo sin redactar desde cero."""
+    CLAUSULA = 'CLAUSULA', 'Cláusula'
+    SALUDO = 'SALUDO', 'Saludo / Apertura'
+    INTRODUCCION = 'INTRODUCCION', 'Introducción / Preámbulo'
+    DESPEDIDA = 'DESPEDIDA', 'Despedida'
+    CIERRE = 'CIERRE', 'Cierre legal'
+    FIRMA = 'FIRMA', 'Bloque de firmas'
+    OTRO = 'OTRO', 'Otro texto útil'
+
+
 class Clausula(models.Model):
     id = models.BigAutoField(primary_key=True)
     tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
                                db_column='tenant_id', related_name='clausulas')
     categoria = models.CharField(max_length=100)
     nombre = models.CharField(max_length=200)
+    tipo_texto = models.CharField(
+        max_length=20,
+        choices=TipoTextoClausula.choices,
+        default=TipoTextoClausula.CLAUSULA,
+        help_text="Función del texto dentro del documento: cláusula legal, saludo, "
+                   "introducción, despedida, cierre o bloque de firmas."
+    )
     RIESGO_CHOICES = [
         ('Alto', 'Alto'),
         ('Medio', 'Medio'),
@@ -146,6 +176,10 @@ class Clausula(models.Model):
         ordering = ['categoria', 'nombre']
         indexes = [
             models.Index(fields=['tenant', 'activa'], name='idx_clausula_tenant_activa'),
+            # Índice del "recopilador por tipo": permite resolver el índice de
+            # textos (agrupado por tipo_texto) en una sola consulta eficiente.
+            models.Index(fields=['tenant', 'tipo_texto', 'activa'],
+                         name='idx_clausula_tenant_tipo'),
         ]
 
     def __str__(self):
@@ -172,3 +206,47 @@ class VersionClausula(models.Model):
 
     def __str__(self):
         return f"{self.clausula.nombre} - {self.etiqueta}"
+
+
+class PreguntaFormulario(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    plantilla = models.ForeignKey(PlantillaDocumento, on_delete=models.CASCADE, related_name='preguntas')
+    texto = models.CharField(max_length=255)
+    TIPO_OPCIONES = [
+        ('booleano', 'Sí / No'),
+        ('opcion_multiple', 'Opción Múltiple'),
+    ]
+    tipo = models.CharField(max_length=20, choices=TIPO_OPCIONES, default='booleano')
+    orden = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'plantillas_preguntaformulario'
+        ordering = ['orden']
+
+    def __str__(self):
+        return self.texto
+
+
+class OpcionRespuesta(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    pregunta = models.ForeignKey(PreguntaFormulario, on_delete=models.CASCADE, related_name='opciones')
+    texto = models.CharField(max_length=150)
+    
+    class Meta:
+        db_table = 'plantillas_opcionrespuesta'
+
+    def __str__(self):
+        return self.texto
+
+
+class ReglaInclusionClausula(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    plantilla = models.ForeignKey(PlantillaDocumento, on_delete=models.CASCADE, related_name='reglas_inclusion')
+    pregunta = models.ForeignKey(PreguntaFormulario, on_delete=models.CASCADE)
+    opcion_respuesta = models.ForeignKey(OpcionRespuesta, on_delete=models.CASCADE, null=True, blank=True)
+    respuesta_booleana = models.BooleanField(null=True, blank=True)
+    clausula_version = models.ForeignKey(VersionClausula, on_delete=models.CASCADE)
+    
+    class Meta:
+        db_table = 'plantillas_reglainclusion'
+

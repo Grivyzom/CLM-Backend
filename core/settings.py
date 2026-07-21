@@ -78,12 +78,12 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'axes.middleware.AxesMiddleware',
     'core.middleware.ClienteBloqueadoMiddleware',
     'django_otp.middleware.OTPMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'core.middleware.SoftwareIsolationMiddleware',
-    'axes.middleware.AxesMiddleware',
 ]
 
 ROOT_URLCONF = 'core.urls'
@@ -245,7 +245,6 @@ AXES_RESET_ON_SUCCESS = True # Resetear contadores al loguearse con éxito
 AXES_LOCKOUT_PARAMETERS = [["username", "ip_address"]] # Bloquear por combinación de usuario e IP
 
 # 3. Seguridad de Sesiones y Cookies
-# NOTA: En producción (HTTPS) cambiar SESSION_COOKIE_SECURE y CSRF_COOKIE_SECURE a True
 SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', str(not DEBUG)).lower() == 'true'
 CSRF_COOKIE_SECURE = os.environ.get('CSRF_COOKIE_SECURE', str(not DEBUG)).lower() == 'true'
 SESSION_EXPIRE_AT_BROWSER_CLOSE = True
@@ -253,6 +252,15 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = 'Lax'   # Lax permite cookies desde el frontend Vite en dev
 CSRF_COOKIE_SAMESITE = 'Lax'
 SESSION_COOKIE_AGE = 900           # 15 minutos de inactividad
+
+# 4. Cabeceras de Seguridad del Servidor (SecurityMiddleware)
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'           # Previene Clickjacking
+SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+
+# Reconocer cabecera de proxy inverso para conexiones HTTPS
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # ==========================================
 # DJANGO REST FRAMEWORK
@@ -316,3 +324,11 @@ DEFAULT_FROM_EMAIL = 'Enfoque Platform <no-reply@grivyzom.com>'
 # Base para los enlaces que van en correos (reset de contraseña, etc.).
 # Nunca derivar del Host header de la request (host header injection).
 FRONTEND_BASE_URL = os.environ.get('FRONTEND_BASE_URL', 'https://clm.grivyzom.com')
+
+# Vigencia del magic-link de firma electrónica OTP (ver contratos.TokenFirmaContrato).
+FIRMA_TOKEN_EXPIRATION_DAYS = int(os.environ.get('FIRMA_TOKEN_EXPIRATION_DAYS', 7))
+
+# Tiempo mínimo entre dos envíos de correo de firma para el mismo contrato
+# (evita que reenviar o regenerar el documento en loop spamee el correo del
+# cliente con enlaces de firma).
+FIRMA_REENVIO_COOLDOWN_SEGUNDOS = int(os.environ.get('FIRMA_REENVIO_COOLDOWN_SEGUNDOS', 60))

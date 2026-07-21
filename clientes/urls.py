@@ -9,4 +9,5 @@ urlpatterns = [
     path('<int:pk>/timeline-pagos/', views.ClienteTimelinePagosView.as_view(), name='cliente-timeline-pagos'),
     path('<int:pk>/correos/', views.ClienteCorreosView.as_view(), name='cliente-correos'),
     path('<int:pk>/enviar-correo/', views.ClienteEnviarCorreoView.as_view(), name='cliente-enviar-correo'),
+    path('<int:pk>/archivos-adjuntables/', views.ClienteArchivosAdjuntablesView.as_view(), name='cliente-archivos-adjuntables'),
 ]

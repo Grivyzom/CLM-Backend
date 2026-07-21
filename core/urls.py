@@ -26,7 +26,6 @@ urlpatterns = [
     path('api/auth/logout/', views.api_logout, name='api_logout'),
     path('api/auth/me/', views.api_me, name='api_me'),
     path('api/auth/register-cliente/', views.api_register_cliente, name='api_register_cliente'),
-    path('api/auth/register-cliente/confirm/', views.api_register_cliente_confirm, name='api_register_cliente_confirm'),
     path('api/auth/password-reset/', views.api_password_reset, name='api_password_reset'),
     path('api/auth/password-reset/confirm/', views.api_password_reset_confirm, name='api_password_reset_confirm'),
     path('api/config/currency/', views.api_currency_config, name='api_currency_config'),

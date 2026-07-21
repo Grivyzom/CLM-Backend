@@ -1,3 +1,4 @@
+import logging
 from django.db.models import Count, Q, Subquery, OuterRef, IntegerField, ProtectedError
 from django.db.models.functions import Coalesce
 from django.db import IntegrityError
@@ -13,6 +14,8 @@ from contratos.models import Contrato
 from .utils import enviar_correo_bienvenida
 from tenants.permissions import DeleteRequiresTenantAdmin, EditRequiresPermiso, IsPlatformClienteAccess, IsTenantMember, RequiresFeature
 from tenants.scoping import enforce_quota, resolve_tenant_for_write, scoped
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Helper: calcular estado de cliente ───────────────────────────────────────
@@ -468,8 +471,34 @@ class ClienteListView(APIView):
                 extra_ctx = {cliente.id: {'contratos_count': 0, 'contacto': None}}
                 data = PersonaJuridicaSerializer(cliente, context={'extra': extra_ctx}).data
 
-            # Enviar correo de bienvenida
-            enviar_correo_bienvenida(cliente)
+            # Crear cuenta de portal inactiva (sin password usable) y enviar
+            # correo de bienvenida con el enlace de activación de un solo uso.
+            # Si el email ya está tomado por un User de OTRO tenant (mismo
+            # correo, dos empresas distintas: el Cliente lo permite, User.username
+            # no), se registra el cliente igual pero sin cuenta de portal
+            # automática — no debe romper el alta del cliente.
+            if cliente.email_principal:
+                from django.db import transaction
+                from tenants.models import User as PortalUser, RolTenant
+                try:
+                    with transaction.atomic():
+                        portal_user = PortalUser(
+                            username=cliente.email_principal,
+                            email=cliente.email_principal,
+                            tenant_id=tenant.id,
+                            role=RolTenant.CLIENTE,
+                            cliente=cliente,
+                            is_active=False,
+                        )
+                        portal_user.set_unusable_password()
+                        portal_user.save()
+                    enviar_correo_bienvenida(cliente, portal_user)
+                except IntegrityError:
+                    logger.warning(
+                        "No se pudo crear cuenta de portal para cliente %s: "
+                        "el email %s ya está en uso por otro usuario.",
+                        cliente.id, cliente.email_principal,
+                    )
 
             return Response(data, status=status.HTTP_201_CREATED)
         except IntegrityError as e:
@@ -602,6 +631,15 @@ class ClienteDetailView(APIView):
         try:
             obj = scoped(PersonaJuridica.objects.all(), request, cliente_field='pk').get(pk=pk)
 
+            old_active = obj.is_active
+            old_data = {
+                'email_principal': obj.email_principal,
+                'telefono_contacto': obj.telefono_contacto,
+                'razon_social': obj.razon_social,
+                'rut': obj.rut,
+                'giro': obj.giro,
+            }
+
             # Actualizar campos
             if 'is_active' in request.data:
                 obj.is_active = request.data.get('is_active', obj.is_active)
@@ -617,6 +655,31 @@ class ClienteDetailView(APIView):
                 obj.giro = request.data.get('giro', obj.giro).strip()
 
             obj.save()
+
+            from notificaciones.models import Notificacion, TipoNotificacion
+            if old_active != obj.is_active:
+                accion_str = "Reactivado" if obj.is_active else "Desactivado"
+                Notificacion.objects.create(
+                    tenant=obj.tenant, cliente=None, para_staff=True,
+                    tipo=TipoNotificacion.AVISO if obj.is_active else TipoNotificacion.URGENTE,
+                    titulo=f"Cliente {accion_str}: {obj.razon_social}",
+                    cuerpo=f"El cliente '{obj.razon_social}' ha sido {accion_str.lower()} por {request.user.username}.",
+                    creado_por=request.user, enlace="/auditoria"
+                )
+            
+            cambios = []
+            for k, old_val in old_data.items():
+                new_val = getattr(obj, k)
+                if old_val != new_val:
+                    cambios.append(k)
+            if cambios:
+                Notificacion.objects.create(
+                    tenant=obj.tenant, cliente=None, para_staff=True,
+                    tipo=TipoNotificacion.INFO,
+                    titulo=f"Cliente Actualizado: {obj.razon_social}",
+                    cuerpo=f"El usuario {request.user.username} modificó: {', '.join(cambios)}.",
+                    creado_por=request.user, enlace="/auditoria"
+                )
 
             contratos_count = Contrato.objects.filter(cliente_id=pk).count()
             statuses = set(Contrato.objects.filter(cliente_id=pk).values_list('status', flat=True))
@@ -640,6 +703,14 @@ class ClienteDetailView(APIView):
         try:
             obj = scoped(PersonaNatural.objects.all(), request, cliente_field='pk').get(pk=pk)
 
+            old_active = obj.is_active
+            old_data = {
+                'email_principal': obj.email_principal,
+                'telefono_contacto': obj.telefono_contacto,
+                'nombre_completo': obj.nombre_completo,
+                'run': obj.run,
+            }
+
             # Actualizar campos
             if 'is_active' in request.data:
                 obj.is_active = request.data.get('is_active', obj.is_active)
@@ -653,6 +724,31 @@ class ClienteDetailView(APIView):
                 obj.run = request.data.get('run', obj.run).strip()
 
             obj.save()
+
+            from notificaciones.models import Notificacion, TipoNotificacion
+            if old_active != obj.is_active:
+                accion_str = "Reactivado" if obj.is_active else "Desactivado"
+                Notificacion.objects.create(
+                    tenant=obj.tenant, cliente=None, para_staff=True,
+                    tipo=TipoNotificacion.AVISO if obj.is_active else TipoNotificacion.URGENTE,
+                    titulo=f"Cliente {accion_str}: {obj.nombre_completo}",
+                    cuerpo=f"El cliente '{obj.nombre_completo}' ha sido {accion_str.lower()} por {request.user.username}.",
+                    creado_por=request.user, enlace="/auditoria"
+                )
+            
+            cambios = []
+            for k, old_val in old_data.items():
+                new_val = getattr(obj, k)
+                if old_val != new_val:
+                    cambios.append(k)
+            if cambios:
+                Notificacion.objects.create(
+                    tenant=obj.tenant, cliente=None, para_staff=True,
+                    tipo=TipoNotificacion.INFO,
+                    titulo=f"Cliente Actualizado: {obj.nombre_completo}",
+                    cuerpo=f"El usuario {request.user.username} modificó: {', '.join(cambios)}.",
+                    creado_por=request.user, enlace="/auditoria"
+                )
 
             contratos_count = Contrato.objects.filter(cliente_id=pk).count()
             statuses = set(Contrato.objects.filter(cliente_id=pk).values_list('status', flat=True))
@@ -674,12 +770,24 @@ class ClienteDetailView(APIView):
 
     def delete(self, request, pk):
         from legal.models import LogAceptacion
+        from tenants.models import User, RolTenant
         if Contrato.objects.filter(cliente_id=pk).exists() or LogAceptacion.objects.filter(cliente_id=pk).exists():
             return Response({'error': 'No se puede eliminar el cliente porque tiene contratos u otros registros asociados.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Buscar en PersonaJuridica
         try:
             obj = scoped(PersonaJuridica.objects.all(), request, cliente_field='pk').get(pk=pk)
+            User.objects.filter(cliente_id=pk, role=RolTenant.CLIENTE).delete()
+            
+            from notificaciones.models import Notificacion, TipoNotificacion
+            Notificacion.objects.create(
+                tenant=obj.tenant, cliente=None, para_staff=True,
+                tipo=TipoNotificacion.URGENTE,
+                titulo=f"Cliente Eliminado: {obj.razon_social}",
+                cuerpo=f"El cliente '{obj.razon_social}' ha sido eliminado por {request.user.username}.",
+                creado_por=request.user, enlace="/auditoria"
+            )
+            
             obj.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
         except PersonaJuridica.DoesNotExist:
@@ -690,6 +798,17 @@ class ClienteDetailView(APIView):
         # Buscar en PersonaNatural
         try:
             obj = scoped(PersonaNatural.objects.all(), request, cliente_field='pk').get(pk=pk)
+            User.objects.filter(cliente_id=pk, role=RolTenant.CLIENTE).delete()
+
+            from notificaciones.models import Notificacion, TipoNotificacion
+            Notificacion.objects.create(
+                tenant=obj.tenant, cliente=None, para_staff=True,
+                tipo=TipoNotificacion.URGENTE,
+                titulo=f"Cliente Eliminado: {obj.nombre_completo}",
+                cuerpo=f"El cliente '{obj.nombre_completo}' ha sido eliminado por {request.user.username}.",
+                creado_por=request.user, enlace="/auditoria"
+            )
+
             obj.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
         except PersonaNatural.DoesNotExist:
@@ -1001,8 +1120,37 @@ class ClienteEnviarCorreoView(APIView):
         asunto = (request.data.get('asunto') or '').strip()
         cuerpo = (request.data.get('cuerpo') or '').strip()
         destinatario = (request.data.get('destinatario') or '').strip() or obj.email_principal
+        adjuntos_seleccionados = request.data.get('adjuntos', [])
+
         if not asunto or not cuerpo:
             return Response({'error': 'Asunto y cuerpo son requeridos'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Retrieve file paths for attachments
+        archivos_para_enviar = []
+        if adjuntos_seleccionados:
+            from contratos.models import Contrato, ArchivoAdjunto
+            from plantillas.models import DocumentoGenerado
+
+            for adj in adjuntos_seleccionados:
+                tipo_entidad = adj.get('tipo_entidad')
+                entidad_id = adj.get('entidad_id')
+                campo = adj.get('campo')
+
+                if tipo_entidad == 'contrato':
+                    c = Contrato.objects.filter(id=entidad_id).first()
+                    if c and c.firma_documento_firmado:
+                        archivos_para_enviar.append(c.firma_documento_firmado.path)
+                elif tipo_entidad == 'archivo_adjunto':
+                    a = ArchivoAdjunto.objects.filter(id=entidad_id).first()
+                    if a and a.archivo:
+                        archivos_para_enviar.append(a.archivo.path)
+                elif tipo_entidad == 'documento_generado':
+                    d = DocumentoGenerado.objects.filter(id=entidad_id).first()
+                    if d:
+                        if campo == 'archivo_pdf' and d.archivo_pdf:
+                            archivos_para_enviar.append(d.archivo_pdf.path)
+                        elif campo == 'archivo_docx' and d.archivo_docx:
+                            archivos_para_enviar.append(d.archivo_docx.path)
 
         registro = CorreoEnviado(
             tenant=obj.tenant,
@@ -1013,7 +1161,7 @@ class ClienteEnviarCorreoView(APIView):
             enviado_por=request.user,
         )
         try:
-            enviar_correo_cliente(obj, asunto, cuerpo, destinatario)
+            enviar_correo_cliente(obj, asunto, cuerpo, destinatario, adjuntos_paths=archivos_para_enviar)
             registro.estado = EstadoCorreo.ENVIADO
             registro.save()
         except Exception as e:
@@ -1032,3 +1180,78 @@ class ClienteEnviarCorreoView(APIView):
             'estado': registro.estado,
             'fecha_envio': registro.fecha_envio,
         }, status=status.HTTP_201_CREATED)
+
+class ClienteArchivosAdjuntablesView(APIView):
+    """
+    GET /api/clientes/<id>/archivos-adjuntables/
+    Devuelve la lista de archivos disponibles para este cliente (documentos generados, contratos firmados, archivos adjuntos de contrato).
+    """
+    permission_classes = [(IsTenantMember & RequiresFeature('clientes')) | IsPlatformClienteAccess]
+
+    def get(self, request, pk):
+        from contratos.models import Contrato, ArchivoAdjunto
+        from plantillas.models import DocumentoGenerado
+
+        obj, tipo = _resolve_cliente_scoped(request, pk)
+        if obj is None:
+            return Response({'error': 'Cliente no encontrado'}, status=status.HTTP_404_NOT_FOUND)
+
+        contratos = Contrato.objects.filter(cliente_id=pk).values_list('id', 'software__nombre')
+        contratos_dict = {c[0]: c[1] for c in contratos}
+        contrato_ids = list(contratos_dict.keys())
+
+        archivos = []
+
+        # Contratos firmados
+        for c in Contrato.objects.filter(id__in=contrato_ids).exclude(firma_documento_firmado=''):
+            if c.firma_documento_firmado:
+                archivos.append({
+                    'id': f"contrato-firmado-{c.id}",
+                    'tipo_entidad': 'contrato',
+                    'entidad_id': c.id,
+                    'campo': 'firma_documento_firmado',
+                    'nombre': f"Contrato Firmado - {contratos_dict[c.id]}",
+                    'url': c.firma_documento_firmado.url if hasattr(c.firma_documento_firmado, 'url') else None,
+                    'origen': f"Contrato #{c.id}",
+                })
+
+        # Archivos Adjuntos a contratos
+        adjuntos = ArchivoAdjunto.objects.filter(contrato_id__in=contrato_ids)
+        for adj in adjuntos:
+            if adj.archivo:
+                archivos.append({
+                    'id': f"adjunto-{adj.id}",
+                    'tipo_entidad': 'archivo_adjunto',
+                    'entidad_id': adj.id,
+                    'campo': 'archivo',
+                    'nombre': adj.nombre or f"Adjunto #{adj.id}",
+                    'url': adj.archivo.url if hasattr(adj.archivo, 'url') else None,
+                    'origen': f"Contrato #{adj.contrato_id}",
+                })
+
+        # Documentos Generados
+        docgens = DocumentoGenerado.objects.filter(contrato_id__in=contrato_ids).select_related('plantilla')
+        for doc in docgens:
+            nombre_base = doc.plantilla.nombre if doc.plantilla else "Documento Generado"
+            if doc.archivo_pdf:
+                archivos.append({
+                    'id': f"docgen-pdf-{doc.id}",
+                    'tipo_entidad': 'documento_generado',
+                    'entidad_id': doc.id,
+                    'campo': 'archivo_pdf',
+                    'nombre': f"{nombre_base}.pdf",
+                    'url': doc.archivo_pdf.url if hasattr(doc.archivo_pdf, 'url') else None,
+                    'origen': f"Contrato #{doc.contrato_id}",
+                })
+            if doc.archivo_docx:
+                archivos.append({
+                    'id': f"docgen-docx-{doc.id}",
+                    'tipo_entidad': 'documento_generado',
+                    'entidad_id': doc.id,
+                    'campo': 'archivo_docx',
+                    'nombre': f"{nombre_base}.docx",
+                    'url': doc.archivo_docx.url if hasattr(doc.archivo_docx, 'url') else None,
+                    'origen': f"Contrato #{doc.contrato_id}",
+                })
+
+        return Response({'results': archivos})

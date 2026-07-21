@@ -170,3 +170,61 @@ class AuditoriaView(APIView):
             'criticalContracts': critical_contracts_list,
             'auditLogs': logs
         })
+
+
+class AnalisisIAView(APIView):
+    permission_classes = [IsTenantMember, RequiresFeature('legal')]
+
+    def get(self, request, contrato_id):
+        contratos = scoped(Contrato.objects.all(), request)
+        try:
+            contrato = contratos.get(pk=contrato_id)
+        except Contrato.DoesNotExist:
+            return Response({'error': 'Contrato no encontrado'}, status=404)
+
+        from legal.models import AnalisisContratoIA
+        analisis = AnalisisContratoIA.objects.filter(contrato=contrato).order_by('-fecha_analisis').first()
+        if not analisis:
+            return Response({
+                'id': None,
+                'fecha_analisis': None,
+                'checklist_cumplido': False,
+                'resultado_checklist_json': {'items': []},
+                'riesgos_detectados_json': [],
+                'contrato_categoria': contrato.software.categoria if contrato.software else 'Software'
+            })
+
+        return Response({
+            'id': analisis.id,
+            'fecha_analisis': analisis.fecha_analisis.isoformat(),
+            'checklist_cumplido': analisis.checklist_cumplido,
+            'resultado_checklist_json': analisis.resultado_checklist_json,
+            'riesgos_detectados_json': analisis.riesgos_detectados_json,
+            'contrato_categoria': contrato.software.categoria if contrato.software else 'Software'
+        })
+
+
+class AnalizarIAView(APIView):
+    permission_classes = [IsTenantMember, RequiresFeature('legal')]
+
+    def post(self, request, contrato_id):
+        contratos = scoped(Contrato.objects.all(), request)
+        try:
+            contrato = contratos.get(pk=contrato_id)
+        except Contrato.DoesNotExist:
+            return Response({'error': 'Contrato no encontrado'}, status=404)
+
+        from legal.services import analizar_contrato_cumplimiento
+        analisis = analizar_contrato_cumplimiento(contrato_id)
+        if not analisis:
+            return Response({'error': 'No se pudo analizar el contrato'}, status=400)
+
+        return Response({
+            'id': analisis.id,
+            'fecha_analisis': analisis.fecha_analisis.isoformat(),
+            'checklist_cumplido': analisis.checklist_cumplido,
+            'resultado_checklist_json': analisis.resultado_checklist_json,
+            'riesgos_detectados_json': analisis.riesgos_detectados_json,
+            'contrato_categoria': contrato.software.categoria if contrato.software else 'Software'
+        })
+

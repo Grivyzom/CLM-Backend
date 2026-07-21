@@ -13,8 +13,10 @@ PDF server-side puede ejecutar. Este módulo:
 
 Los HTML "planos" (sin scaffolding dc) pasan sin modificación.
 """
+import copy
 import os
 import re
+from functools import lru_cache
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -54,13 +56,19 @@ def cargar_plantilla_html(ruta_relativa: str) -> str:
     return adaptar_dc_a_imprimible(texto)
 
 
+# Archivos de DOCS_TEMPLATE_DIR que el motor usa internamente (ej. certificado
+# de firma electrónica anexado al PDF firmado) pero que NO son plantillas de
+# contrato seleccionables por el usuario en el catálogo.
+NOMBRES_RESERVADOS = {'Certificado de Firma.dc.html'}
+
+
 def listar_plantillas_docs():
     """Nombres de archivo .html disponibles en DOCS_TEMPLATE_DIR (para ofrecerlos
     como templates en el CLM)."""
     base = Path(settings.DOCS_TEMPLATE_DIR)
     if not base.is_dir():
         return []
-    return sorted(p.name for p in base.glob('*.html'))
+    return sorted(p.name for p in base.glob('*.html') if p.name not in NOMBRES_RESERVADOS)
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +130,47 @@ VARIABLES_RESERVADAS = {
 
 _RE_VARIABLE = re.compile(r'\{\{\s*([a-zA-Z_]\w*)\s*(?:\|\s*default:"([^"]*)")?[^}]*\}\}')
 
+# Nodos de texto del HTML previos a un placeholder ("PRIMERA: Objeto y ...").
+_RE_TEXTO_NODO = re.compile(r'>\s*([^<>{}]+?)\s*<')
+
 _PREFIJOS_MULTILINEA = ('parrafo', 'cuerpo', 'texto', 'descripcion', 'detalle')
+
+
+def _titulo_seccion_previo(html: str, pos: int):
+    """Encabezado de sección que precede inmediatamente a un placeholder de
+    cláusula: el último nodo de texto no vacío antes de `pos` (en las plantillas
+    dc es el <div> con "PRIMERA: Objeto y Definiciones"). None si no hay uno
+    razonable (muy largo o vacío)."""
+    nodos = _RE_TEXTO_NODO.findall(html[:pos])
+    for texto in reversed(nodos):
+        limpio = ' '.join(texto.split())
+        if not limpio:
+            continue
+        return limpio if len(limpio) <= 140 else None
+    return None
 
 
 def extraer_campos_manuales(ruta_relativa: str):
     """Descubre los campos que la plantilla espera del usuario, escaneando las
     variables {{ nombre }} del HTML crudo y excluyendo las reservadas del
-    contrato. Devuelve [{'nombre', 'label', 'default', 'multilinea'}] en el
-    orden de aparición en el documento."""
+    contrato. Devuelve [{'nombre', 'label', 'default', 'multilinea',
+    'titulo_seccion'?}] en el orden de aparición en el documento.
+
+    titulo_seccion (solo campos cuerpo_clausula*): encabezado fijo de la
+    cláusula en la plantilla — permite al frontend etiquetar el campo con el
+    título real y sugerir/validar la cláusula de biblioteca que corresponde.
+
+    Cacheado por (ruta, mtime): las plantillas solo cambian en deploys, así
+    que el doble escaneo regex del archivo no se repite en cada request.
+    Devuelve copias profundas para que ningún caller mute la caché."""
+    path = _resolver_ruta_segura(ruta_relativa)
+    return copy.deepcopy(
+        _extraer_campos_cacheado(ruta_relativa, path.stat().st_mtime_ns)
+    )
+
+
+@lru_cache(maxsize=64)
+def _extraer_campos_cacheado(ruta_relativa: str, _mtime_ns: int):
     texto = _resolver_ruta_segura(ruta_relativa).read_text(encoding='utf-8')
 
     campos, vistos = [], set()
@@ -138,12 +179,17 @@ def extraer_campos_manuales(ruta_relativa: str):
         if nombre in VARIABLES_RESERVADAS or nombre in vistos:
             continue
         vistos.add(nombre)
-        campos.append({
+        campo = {
             'nombre': nombre,
             'label': nombre.replace('_', ' ').capitalize(),
             'default': default,
             'multilinea': nombre.lower().startswith(_PREFIJOS_MULTILINEA),
-        })
+        }
+        if nombre.startswith('cuerpo_clausula'):
+            titulo = _titulo_seccion_previo(texto, match.start())
+            if titulo:
+                campo['titulo_seccion'] = titulo
+        campos.append(campo)
     return campos
 
 
@@ -171,6 +217,17 @@ def es_formato_dc(html: str) -> bool:
     return '<x-dc' in html or '<x-import' in html
 
 
+_RE_SC_RAW_TAG = re.compile(r'(</?)sc-raw-([a-z][a-z0-9]*)')
+
+
+def _destapar_sc_raw(html: str) -> str:
+    """Los exports dc escapan elementos HTML "crudos" como <sc-raw-table>,
+    <sc-raw-tr>, etc.; en el navegador support.js los renombra al tag real.
+    Sin este paso WeasyPrint los trata como inline anónimos y las tablas
+    colapsan en una sola línea."""
+    return _RE_SC_RAW_TAG.sub(r'\1\2', html)
+
+
 def adaptar_dc_a_imprimible(html: str) -> str:
     """Convierte un .dc.html exportado de Claude Design en HTML imprimible.
 
@@ -185,6 +242,7 @@ def adaptar_dc_a_imprimible(html: str) -> str:
     if not es_formato_dc(html):
         return html.replace('Calibri', 'Carlito')
 
+    html = _destapar_sc_raw(html)
     soup = BeautifulSoup(html, 'html.parser')
 
     ximport = soup.find('x-import')

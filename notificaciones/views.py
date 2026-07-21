@@ -37,6 +37,8 @@ def _serialize(n):
         'fecha_creacion': n.fecha_creacion,
         'leida': n.leida,
         'leida_en': n.leida_en,
+        'para_staff': n.para_staff,
+        'enlace': n.enlace,
     }
 
 
@@ -54,6 +56,12 @@ class NotificacionListCreateView(APIView):
         cliente = request.query_params.get('cliente')
         if cliente:
             qs = qs.filter(cliente_id=cliente)
+        
+        if request.query_params.get('para_staff') in ('1', 'true'):
+            qs = qs.filter(para_staff=True)
+        else:
+            qs = qs.filter(para_staff=False)
+            
         if request.query_params.get('solo_no_leidas') in ('1', 'true'):
             qs = qs.filter(leida=False)
         try:
@@ -118,9 +126,13 @@ class NotificacionLeerTodasView(APIView):
     permission_classes = PERMISOS_NOTIFICACIONES
 
     def post(self, request):
-        actualizadas = _scope_notificaciones(
-            Notificacion.objects.filter(leida=False), request
-        ).update(leida=True, leida_en=timezone.now())
+        qs = _scope_notificaciones(Notificacion.objects.filter(leida=False), request)
+        if request.query_params.get('para_staff') in ('1', 'true'):
+            qs = qs.filter(para_staff=True)
+        else:
+            qs = qs.filter(para_staff=False)
+        
+        actualizadas = qs.update(leida=True, leida_en=timezone.now())
         return Response({'actualizadas': actualizadas})
 
 
@@ -129,7 +141,10 @@ class NotificacionUnreadCountView(APIView):
     permission_classes = PERMISOS_NOTIFICACIONES
 
     def get(self, request):
-        count = _scope_notificaciones(
-            Notificacion.objects.filter(leida=False), request
-        ).count()
+        qs = _scope_notificaciones(Notificacion.objects.filter(leida=False), request)
+        if request.query_params.get('para_staff') in ('1', 'true'):
+            qs = qs.filter(para_staff=True)
+        else:
+            qs = qs.filter(para_staff=False)
+        count = qs.count()
         return Response({'count': count})

@@ -84,7 +84,7 @@ class SinPlantillaActivaError(PlantillaRenderError):
 def construir_docx_desde_clausulas(plantilla=None, contrato=None) -> io.BytesIO:
     from docx import Document
     from docx.shared import Pt, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 
     doc = Document()
     
@@ -139,7 +139,104 @@ def construir_docx_desde_clausulas(plantilla=None, contrato=None) -> io.BytesIO:
     doc.add_paragraph()
     # ----------------------------------------
 
-    if contrato and contrato.texto_adicional_clausulas:
+    def _numerar_bloques_doc(bloques):
+        """Numeración jerárquica para bloques."""
+        contadores = [0, 0, 0]
+        numeros = []
+        for b in bloques:
+            nivel = max(0, min(2, int(b.get('nivel') or 0)))
+            contadores[nivel] += 1
+            for l in range(nivel + 1, 3):
+                contadores[l] = 0
+            if nivel == 0:
+                numero = f"{contadores[0]}."
+            elif nivel == 1:
+                numero = f"{contadores[0]}.{contadores[1]}"
+            else:
+                numero = f"{chr(ord('a') + contadores[2] - 1)})"
+            numeros.append((numero, nivel))
+        return numeros
+
+    def _render_contenido_rico(doc, contenido, indent_pt):
+        """Renderiza nodos Tiptap/ProseMirror a docx."""
+        if not isinstance(contenido, (dict, list)):
+            return
+        nodos = contenido.get('content', []) if isinstance(contenido, dict) else contenido
+        for nodo in nodos:
+            if not isinstance(nodo, dict):
+                continue
+            tipo = nodo.get('type')
+            if tipo == 'paragraph':
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                p.paragraph_format.left_indent = indent_pt
+                p.paragraph_format.space_after = Pt(6)
+                _agregar_runs(p, nodo.get('content', []))
+            elif tipo in ('bulletList', 'orderedList'):
+                style = 'List Bullet' if tipo == 'bulletList' else 'List Number'
+                for item in nodo.get('content', []):
+                    if isinstance(item, dict) and item.get('type') == 'listItem':
+                        for hijo in item.get('content', []):
+                            if isinstance(hijo, dict) and hijo.get('type') == 'paragraph':
+                                p = doc.add_paragraph(style=style)
+                                p.paragraph_format.left_indent = indent_pt + Pt(18)
+                                p.paragraph_format.space_after = Pt(3)
+                                _agregar_runs(p, hijo.get('content', []))
+
+    def _agregar_runs(paragraph, nodos_texto):
+        """Agrega runs con formato a un párrafo."""
+        for n in nodos_texto:
+            if not isinstance(n, dict):
+                continue
+            if n.get('type') == 'hardBreak':
+                paragraph.add_run().add_break(WD_BREAK.LINE)
+                continue
+            if n.get('type') == 'text':
+                run = paragraph.add_run(n.get('text', ''))
+                marks = {m.get('type') for m in (n.get('marks') or []) if isinstance(m, dict)}
+                if 'bold' in marks:
+                    run.bold = True
+                if 'italic' in marks:
+                    run.italic = True
+                if 'underline' in marks:
+                    run.underline = True
+
+    def _agregar_bloque(numero, nivel, titulo, texto, contenido):
+        """Renderiza un bloque con título, texto plano legado o contenido rico."""
+        indent = Pt(18 * nivel)
+        if titulo:
+            if nivel == 0:
+                h = doc.add_heading(f"{numero} {titulo.upper()}", level=1)
+                h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                if h.runs:
+                    h.runs[0].font.color.rgb = RGBColor(0x1E, 0x40, 0xAF)
+            elif nivel == 1:
+                h = doc.add_heading(f"{numero} {titulo.upper()}", level=2)
+                h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                if h.runs:
+                    h.runs[0].font.color.rgb = RGBColor(0x1E, 0x40, 0xAF)
+                h.paragraph_format.left_indent = indent
+            else:  # nivel 2: párrafo en negrita
+                p = doc.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                p.paragraph_format.left_indent = indent
+                run = p.add_run(f"{numero} {titulo}")
+                run.bold = True
+        if contenido and isinstance(contenido, (dict, list)):
+            _render_contenido_rico(doc, contenido, indent)
+        else:
+            for p_text in (texto or '').split('\n'):
+                if p_text.strip():
+                    p = doc.add_paragraph(p_text.strip())
+                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    p.paragraph_format.left_indent = indent
+                    p.paragraph_format.space_after = Pt(6)
+
+    if contrato and contrato.clausulas_estructuradas:
+        numeros_y_niveles = _numerar_bloques_doc(contrato.clausulas_estructuradas)
+        for (numero, nivel), bloque in zip(numeros_y_niveles, contrato.clausulas_estructuradas):
+            _agregar_bloque(numero, nivel, (bloque.get('titulo') or '').strip(), bloque.get('texto') or '', bloque.get('contenido'))
+    elif contrato and contrato.texto_adicional_clausulas:
         for p_text in contrato.texto_adicional_clausulas.split('\n'):
             if p_text.strip():
                 # Detectar encabezado si empieza con un número seguido de punto y espacio
@@ -250,6 +347,23 @@ def renderizar_html(plantilla: PlantillaDocumento, contexto: dict) -> bytes:
         contexto = dict(contexto)
         contexto.setdefault('fecha_documento', fecha_larga_es())
         html_imprimible = cargar_plantilla_html(plantilla.ruta_plantilla_html)
+        
+        clausulas_a_remover = [k for k, v in contexto.items() if v == '__REMOVE__']
+        if clausulas_a_remover:
+            from bs4 import BeautifulSoup
+            import re
+            soup = BeautifulSoup(html_imprimible, 'html.parser')
+            for c_rem in clausulas_a_remover:
+                for node in soup.find_all(string=re.compile(r'\{\{\s*' + re.escape(c_rem) + r'\b')):
+                    if node.parent:
+                        node.parent.decompose()
+                num = c_rem.split('_')[-1]
+                t_rem = f'titulo_clausula_{num}'
+                for node in soup.find_all(string=re.compile(r'\{\{\s*' + re.escape(t_rem) + r'\b')):
+                    if node.parent:
+                        node.parent.decompose()
+            html_imprimible = str(soup)
+            
         html_str = engines['django'].from_string(html_imprimible).render(contexto)
         return html_str.encode('utf-8')
     except Exception as exc:
@@ -350,6 +464,42 @@ def obtener_preview_pdf(plantilla: PlantillaDocumento) -> Path:
     return pdf_path
 
 
+def obtener_preview_imagen(plantilla: PlantillaDocumento) -> Path:
+    """Extrae la primera página del PDF de la plantilla como imagen (JPG)."""
+    import pdfplumber
+    pdf_path = obtener_preview_pdf(plantilla)
+    img_path = pdf_path.with_suffix('.jpg')
+    
+    if not img_path.exists():
+        with pdfplumber.open(pdf_path) as pdf:
+            if pdf.pages:
+                page = pdf.pages[0]
+                im = page.to_image(resolution=300) # Alta calidad para evitar pixelado
+                # Convertir a RGB usando .original que es el objeto de PIL Image
+                pil_img = getattr(im, 'original', im)
+                if hasattr(pil_img, 'convert'):
+                    pil_img = pil_img.convert('RGB')
+                pil_img.save(str(img_path), format='JPEG')
+    return img_path
+
+
+def aplicar_campos_manuales(contexto: dict, campos):
+    """Mezcla los campos manuales del usuario al contexto de render, ignorando
+    variables reservadas del sistema. Un cuerpo_clausula* vacío se marca
+    '__REMOVE__' (la sección se elimina del documento). Compartido por la
+    generación real y la vista previa de borrador."""
+    if not campos:
+        return
+    from .html_doc import VARIABLES_RESERVADAS
+    for clave, valor in campos.items():
+        if clave in VARIABLES_RESERVADAS:
+            continue
+        if str(valor).strip():
+            contexto[clave] = str(valor)
+        elif clave.startswith('cuerpo_clausula'):
+            contexto[clave] = '__REMOVE__'
+
+
 def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=None,
                       campos: dict = None) -> DocumentoGenerado:
     """Orquesta: resuelve plantilla si no viene dada, construye contexto,
@@ -363,12 +513,7 @@ def generar_documento(contrato, plantilla: PlantillaDocumento = None, usuario=No
         plantilla = resolver_plantilla_activa(contrato.tipo_contrato, contrato.software_id, contrato.tenant)
 
     contexto = construir_contexto(contrato)
-
-    if campos:
-        from .html_doc import VARIABLES_RESERVADAS
-        for clave, valor in campos.items():
-            if clave not in VARIABLES_RESERVADAS and str(valor).strip():
-                contexto[clave] = str(valor)
+    aplicar_campos_manuales(contexto, campos)
 
     if plantilla.modo_origen == ModoOrigenPlantilla.HTML:
         from .html_doc import html_a_pdf, siguiente_referencia

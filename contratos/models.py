@@ -40,6 +40,8 @@ class TipoContrato(models.TextChoices):
     PERPETUO = 'PERPETUO', 'Perpetuo'
     PRO_BONO = 'PRO_BONO', 'Pro Bono'
     INTERNO = 'INTERNO', 'Interno / Propio'
+    REQUERIMIENTO = 'REQUERIMIENTO', 'Ficha de Requerimiento'
+    ERS = 'ERS', 'Especificación de Requerimientos'
 
 class EstadoContrato(models.TextChoices):
     ACTIVO = 'ACTIVO', 'Activo'
@@ -87,6 +89,13 @@ class Contrato(models.Model):
     parent_contrato = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='versiones_hijas', db_column='parent_contrato_id')
     
     texto_adicional_clausulas = models.TextField(blank=True, null=True, help_text="Texto editable para contratos generados por cláusulas")
+    clausulas_estructuradas = models.JSONField(
+        null=True, blank=True,
+        help_text="Bloques del documento generado por cláusulas: lista de "
+                  "{titulo, texto, clausula_id?, version_id?, origen, modificada, nivel?, contenido?}. "
+                  "Tiene prioridad sobre texto_adicional_clausulas al renderizar."
+    )
+    clausulas_actualizado_en = models.DateTimeField(null=True, blank=True, editable=False, help_text="Fecha de última edición de cláusulas estructuradas o texto adicional")
 
     # Integración con procesadores de texto (Word / Google Docs)
     external_editor = models.CharField(max_length=20, null=True, blank=True, choices=[('WORD', 'Microsoft Word'), ('GDOCS', 'Google Docs')], help_text="Procesador externo vinculado")
@@ -160,6 +169,48 @@ class HistorialEtapaContrato(models.Model):
 
     class Meta:
         db_table = 'contratos_historialetapa'
+
+
+class TokenFirmaContrato(models.Model):
+    """Token de un solo uso para el magic-link de firma electrónica OTP enviado
+    por correo. Persistido (no el default_token_generator de Django) porque el
+    firmante es un Cliente, no un AUTH_USER_MODEL."""
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE,
+                                  db_column='contrato_id', related_name='tokens_firma')
+    token = models.CharField(max_length=64, unique=True, editable=False)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_expiracion = models.DateTimeField()
+    fecha_uso = models.DateTimeField(null=True, blank=True)
+    ip_confirmacion = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        db_table = 'contratos_tokenfirmacontrato'
+        indexes = [models.Index(fields=['token'], name='idx_tokenfirma_token')]
+
+    def vigente(self):
+        from django.utils import timezone
+        return self.fecha_uso is None and timezone.now() < self.fecha_expiracion
+
+
+class GuestLink(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE, related_name='guest_links', db_column='contrato_id')
+    token = models.CharField(max_length=64, unique=True, editable=False)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_expiracion = models.DateTimeField(null=True, blank=True)
+    can_comment = models.BooleanField(default=True)
+    can_sign = models.BooleanField(default=False)
+    
+    class Meta:
+        db_table = 'contratos_guestlink'
+        indexes = [models.Index(fields=['token'], name='idx_guestlink_token')]
+
+    def is_valid(self):
+        if self.fecha_expiracion:
+            from django.utils import timezone
+            return timezone.now() < self.fecha_expiracion
+        return True
 
 
 class RegistroPerdonazo(models.Model):
@@ -276,3 +327,46 @@ class ObligacionSLAAuditLog(models.Model):
 
     class Meta:
         db_table = 'contratos_obligacionsla_auditlog'
+
+class TipoComentario(models.TextChoices):
+    SUGERENCIA = 'SUGERENCIA', 'Sugerencia'
+    IMPORTANTE = 'IMPORTANTE', 'Importante'
+    URGENTE = 'URGENTE', 'Urgente'
+
+class ComentarioContrato(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE, related_name='comentarios', db_column='contrato_id')
+    usuario = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    guest_name = models.CharField(max_length=150, null=True, blank=True, help_text="Nombre del invitado si el comentario se hace desde Guest Portal")
+    texto = models.TextField()
+    tipo = models.CharField(max_length=20, choices=TipoComentario.choices, default=TipoComentario.SUGERENCIA)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'contratos_comentario'
+        ordering = ['-fecha_creacion']
+
+class EstadoHito(models.TextChoices):
+    PENDIENTE = 'PENDIENTE', 'Pendiente'
+    COMPLETADO = 'COMPLETADO', 'Completado'
+    ATRASADO = 'ATRASADO', 'Atrasado'
+
+class HitoContrato(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey(Contrato, on_delete=models.CASCADE, related_name='hitos', db_column='contrato_id')
+    descripcion = models.CharField(max_length=255)
+    fecha_esperada = models.DateField()
+    fecha_completada = models.DateField(null=True, blank=True)
+    estado = models.CharField(max_length=20, choices=EstadoHito.choices, default=EstadoHito.PENDIENTE)
+    responsable = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='hitos_asignados')
+    dias_aviso_previo = models.IntegerField(default=7, help_text="Días de anticipación para notificar al responsable")
+    alerta_enviada = models.BooleanField(default=False)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    fecha_actualizacion = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'contratos_hitocontrato'
+        ordering = ['fecha_esperada']
+
+    def __str__(self):
+        return f"{self.descripcion} ({self.fecha_esperada})"

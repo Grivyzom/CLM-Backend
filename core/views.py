@@ -13,6 +13,7 @@ from django.db.models import Q
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST, require_http_methods
+from axes.decorators import axes_dispatch
 
 logger = logging.getLogger(__name__)
 from django_otp.plugins.otp_totp.models import TOTPDevice
@@ -30,6 +31,7 @@ def _user_payload(user):
     payload = {
         'id': user.id,
         'username': user.username,
+        'full_name': user.get_full_name() or '',
         'is_staff': user.is_staff,
         'is_superadmin': user.is_superadmin,
         'role': user.role if user.tenant_id else None,
@@ -51,6 +53,7 @@ def _user_payload(user):
 
 @csrf_exempt
 @require_POST
+@axes_dispatch
 def api_login(request):
     try:
         data = json.loads(request.body)
@@ -300,92 +303,18 @@ def api_currency_config(request):
 @csrf_exempt
 @require_POST
 def api_register_cliente(request):
-    """Auto-registro del portal de cliente.
+    """Completa el registro del portal de cliente en un solo paso.
 
-    La cuenta se crea inactiva y solo se habilita al confirmar el enlace
-    enviado a `email_principal` del Cliente (api_register_cliente_confirm,
-    mismo mecanismo de token de un solo uso que password-reset). Sin esto,
-    conocer el email_principal de un Cliente (dato a menudo público, ej. un
-    correo de contacto comercial) bastaba para crear una cuenta con rol
-    CLIENTE y acceder a su workspace suplantándolo.
+    La cuenta de portal (User inactivo, sin password usable) ya fue creada
+    al momento de dar de alta al Cliente (ver enviar_correo_bienvenida /
+    ClienteListView.post), junto con el enlace de un solo uso (uid+token,
+    mismo default_token_generator que password-reset) que llegó por correo.
+    Esta vista valida ese enlace y, en el mismo paso, fija la contraseña y
+    activa la cuenta — sin un segundo correo de confirmación. Sin la
+    verificación de uid+token, conocer el email_principal de un Cliente
+    (dato a menudo público, ej. un correo de contacto comercial) bastaría
+    para tomar el registro de otra persona.
     """
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'error': 'JSON inválido'}, status=400)
-
-    email = data.get('email')
-    password = data.get('password')
-
-    if not email or not password:
-        return JsonResponse({'error': 'Email y contraseña son requeridos'}, status=400)
-
-    try:
-        validate_password(password)
-    except DjangoValidationError as e:
-        return JsonResponse({'error': ' '.join(e.messages)}, status=400)
-
-    # Buscar al cliente
-    cliente = Cliente.objects.filter(email_principal=email).first()
-    if not cliente:
-        return JsonResponse({'error': 'No existe un cliente registrado con este correo'}, status=404)
-
-    if not cliente.is_active:
-        return JsonResponse({
-            'error': 'Este cliente está bloqueado y no puede registrar una cuenta. Contacta a soporte.',
-            'code': 'CLIENTE_BLOQUEADO',
-        }, status=403)
-
-    User = get_user_model()
-    if User.objects.filter(username=email).exists():
-        return JsonResponse({'error': 'Ya existe una cuenta con este correo'}, status=400)
-
-    # Crear usuario inactivo: no puede autenticarse hasta confirmar el correo
-    try:
-        from tenants.models import RolTenant
-        user = User.objects.create_user(
-            username=email,
-            email=email,
-            password=password,
-            tenant_id=cliente.tenant_id,
-            role=RolTenant.CLIENTE,
-            cliente=cliente,
-            is_active=False,
-        )
-    except Exception as e:
-        return JsonResponse({'error': f'Error al crear la cuenta: {str(e)}'}, status=500)
-
-    uid = urlsafe_base64_encode(force_bytes(user.pk))
-    token = default_token_generator.make_token(user)
-    url = f"{settings.FRONTEND_BASE_URL}/portal/confirmar/{uid}/{token}"
-    try:
-        send_mail(
-            'Confirma tu cuenta — Enfoque Platform',
-            (
-                f'Hola,\n\n'
-                'Creaste una cuenta en el portal de clientes de Enfoque Platform (CLM) '
-                f'asociada al correo {email}.\n\n'
-                f'Confirma tu cuenta abriendo este enlace:\n{url}\n\n'
-                'El enlace es de un solo uso y expira pronto. Si no solicitaste esto, '
-                'ignora este correo: la cuenta no queda activa.'
-            ),
-            None,  # DEFAULT_FROM_EMAIL
-            [email],
-        )
-    except Exception:
-        logger.exception('Fallo al enviar correo de confirmación de registro para user id=%s', user.pk)
-        user.delete()
-        return JsonResponse({'error': 'No se pudo enviar el correo de confirmación. Intenta nuevamente.'}, status=500)
-
-    return JsonResponse({
-        'success': 'Cuenta creada. Revisa tu correo para confirmarla antes de iniciar sesión.',
-    })
-
-
-@csrf_exempt
-@require_POST
-def api_register_cliente_confirm(request):
-    """Valida uid+token del correo de registro y activa la cuenta."""
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -393,8 +322,15 @@ def api_register_cliente_confirm(request):
 
     uid = data.get('uid')
     token = data.get('token')
-    if not uid or not token:
-        return JsonResponse({'error': 'Falta uid o token'}, status=400)
+    password = data.get('password')
+
+    if not uid or not token or not password:
+        return JsonResponse({'error': 'Faltan datos para completar el registro'}, status=400)
+
+    try:
+        validate_password(password)
+    except DjangoValidationError as e:
+        return JsonResponse({'error': ' '.join(e.messages)}, status=400)
 
     User = get_user_model()
     try:
@@ -403,8 +339,16 @@ def api_register_cliente_confirm(request):
         user = None
 
     if user is None or not default_token_generator.check_token(user, token):
-        return JsonResponse({'error': 'El enlace de confirmación es inválido o expiró.'}, status=400)
+        return JsonResponse({'error': 'El enlace de activación es inválido o expiró.'}, status=400)
 
+    cliente = Cliente.objects.filter(pk=user.cliente_id).first()
+    if cliente and not cliente.is_active:
+        return JsonResponse({
+            'error': 'Este cliente está bloqueado y no puede activar una cuenta. Contacta a soporte.',
+            'code': 'CLIENTE_BLOQUEADO',
+        }, status=403)
+
+    user.set_password(password)
     user.is_active = True
-    user.save(update_fields=['is_active'])
-    return JsonResponse({'success': 'Cuenta confirmada. Ya puedes iniciar sesión.'})
+    user.save(update_fields=['password', 'is_active'])
+    return JsonResponse({'success': 'Cuenta activada. Ya puedes iniciar sesión.'})

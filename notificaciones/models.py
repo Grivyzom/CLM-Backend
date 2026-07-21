@@ -18,12 +18,18 @@ class Notificacion(models.Model):
     id = models.BigAutoField(primary_key=True)
     tenant = models.ForeignKey('tenants.Tenant', on_delete=models.CASCADE,
                                db_column='tenant_id', related_name='notificaciones')
-    cliente = models.ForeignKey('clientes.Cliente', on_delete=models.CASCADE,
-                                db_column='cliente_id', related_name='notificaciones')
+    cliente = models.ForeignKey('clientes.Cliente', on_delete=models.SET_NULL,
+                                db_column='cliente_id', related_name='notificaciones',
+                                null=True, blank=True)
+    usuario_destino = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+                                        db_column='usuario_destino_id', related_name='notificaciones_recibidas',
+                                        null=True, blank=True, help_text="Si está seteado, la notificación es para este usuario específico")
     titulo = models.CharField(max_length=150)
     cuerpo = models.TextField()
     tipo = models.CharField(max_length=10, choices=TipoNotificacion.choices,
                             default=TipoNotificacion.INFO)
+    para_staff = models.BooleanField(default=False, help_text="True si es para admins/moderadores")
+    enlace = models.CharField(max_length=255, null=True, blank=True)
     creado_por = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
                                    null=True, blank=True, db_column='creado_por_id',
                                    related_name='notificaciones_creadas')

@@ -15,6 +15,7 @@ python-pptx==1.0.2
 reportlab==4.4.4
 weasyprint==69.0
 beautifulsoup4==4.12.3
+pypdf==5.1.0
 
 # Storage S3 opcional (ver core/settings.py, USE_S3_STORAGE): descomentar e
 # instalar solo si se activa ese modo. Sin la env var, Django ni las importa.

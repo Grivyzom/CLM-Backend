@@ -14,12 +14,17 @@ from contratos.models import Contrato, EtapaContrato, TipoContrato
 from catalogo.models import Producto
 from tenants.permissions import DeleteRequiresTenantAdmin, IsTenantMember, RequiresFeature
 from tenants.scoping import resolve_tenant_for_write, scoped
-from .models import PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula, ModoOrigenPlantilla
+from .models import (
+    PlantillaDocumento, DocumentoGenerado, Clausula, VersionClausula,
+    ModoOrigenPlantilla, TipoTextoClausula,
+)
 from .services.validacion import validar_docx_subido
 from .services.renderizado import (
     generar_documento, resolver_plantilla_activa, obtener_preview_pdf,
+    aplicar_campos_manuales, renderizar_html,
     PlantillaRenderError, VariablesFaltantesError, SinPlantillaActivaError, ConversionPDFError,
 )
+from .services.contexto import construir_contexto
 from .services.html_doc import PlantillaHTMLNoEncontrada
 
 # Etapas en las que el contrato ya tiene un documento "vigente" — regenerar acá
@@ -101,15 +106,31 @@ def _plantilla_a_dict(p: PlantillaDocumento):
         'modo_origen_display': p.get_modo_origen_display(),
         'version_codigo': p.version_codigo,
         'activa': p.activa,
+        'confirmada': p.confirmada,
         'fecha_creacion': p.fecha_creacion,
         'usos': usos,
         # .all() en vez de .values_list(): cuando el caller usó prefetch_related
         # (listado) esto lee de la caché ya cargada en vez de disparar otra query.
         'clausulas_seleccionadas': [c.id for c in p.clausulas_seleccionadas.all()],
         'ruta_plantilla_html': p.ruta_plantilla_html if p.modo_origen == 'html' else None,
-        'codigo_prefijo': p.codigo_prefijo if p.modo_origen == 'html' else None,
+        'codigo_prefijo': p.codigo_prefijo,
         'requiere_sla_facturacion': p.requiere_sla_facturacion,
+        'portada': p.portada.url if p.portada else None,
+        'tiene_formulario_dinamico': getattr(p, 'tiene_formulario_dinamico', p.preguntas.exists()),
     }
+
+
+def _colision_activa(tenant, tipo_contrato, software_id, exclude_pk=None):
+    """Devuelve la plantilla actualmente activa para (tenant, tipo_contrato, software),
+    si existe y es distinta de exclude_pk. PlantillaDocumento.save() desactiva esa fila
+    en silencio en cuanto se guarda una nueva activa para la misma combinación — este
+    helper existe para poder avisarle al usuario ANTES de que eso ocurra."""
+    qs = PlantillaDocumento.objects.filter(
+        tenant=tenant, tipo_contrato=tipo_contrato, software_id=software_id, activa=True,
+    )
+    if exclude_pk is not None:
+        qs = qs.exclude(pk=exclude_pk)
+    return qs.first()
 
 
 def _documento_a_dict(d: DocumentoGenerado):
@@ -117,7 +138,7 @@ def _documento_a_dict(d: DocumentoGenerado):
         'id': d.id,
         'contrato_id': d.contrato_id,
         'plantilla_id': d.plantilla_id,
-        'plantilla_version': d.plantilla.version_codigo,
+        'plantilla_version': d.plantilla.version_codigo if d.plantilla_id else 'N/A (Eliminada)',
         'hash_sha256': d.hash_sha256,
         'fecha_generacion': d.fecha_generacion,
         'generado_por': d.generado_por_id,
@@ -150,9 +171,14 @@ class PlantillaListCreateView(APIView):
         software_id = request.GET.get('software')
         activa = request.GET.get('activa')
         modo_origen = request.GET.get('modo_origen')
+        codigo_prefijo = request.GET.get('codigo_prefijo')
         incluir_globales = request.GET.get('incluir_globales', '').lower() in ('1', 'true', 'si')
         if tipo_contrato:
             qs = qs.filter(tipo_contrato=tipo_contrato)
+        if codigo_prefijo:
+            # Todas las versiones de una misma familia de documento (ej. todas las NDA),
+            # para el catálogo agrupado.
+            qs = qs.filter(codigo_prefijo__iexact=codigo_prefijo)
         if software_id:
             # `incluir_globales` suma las plantillas sin software asignado, que el
             # motor de renderizado usa como fallback (resolver_plantilla_activa).
@@ -177,6 +203,7 @@ class PlantillaListCreateView(APIView):
         version_codigo = request.data.get('version_codigo')
         software_id = request.data.get('software') or None
         modo_origen = request.data.get('modo_origen', ModoOrigenPlantilla.ARCHIVO)
+        codigo_prefijo = (request.data.get('codigo_prefijo') or '').strip().upper()[:20]
 
         errors = {}
         if not nombre:
@@ -191,6 +218,11 @@ class PlantillaListCreateView(APIView):
             errors['software'] = 'Debe especificar a qué software/producto pertenece esta plantilla.'
         if modo_origen not in ModoOrigenPlantilla.values:
             errors['modo_origen'] = f'Modo inválido. Opciones: {list(ModoOrigenPlantilla.values)}'
+        if not codigo_prefijo:
+            errors['codigo_prefijo'] = (
+                'Debe indicar la familia de documento (ej: NDA, MSA, TOS) — agrupa las distintas '
+                'versiones de un mismo documento en el catálogo.'
+            )
         if errors:
             raise DRFValidationError(errors)
 
@@ -214,6 +246,23 @@ class PlantillaListCreateView(APIView):
             raise DRFValidationError({'software': 'Producto no encontrado.'})
 
         activa = str(request.data.get('activa', 'true')).lower() in ('1', 'true', 'si')
+        confirmar = str(request.data.get('confirmar', 'false')).lower() in ('1', 'true', 'si')
+
+        if activa:
+            conflicto = _colision_activa(tenant, tipo_contrato, software_id)
+            if conflicto and not confirmar:
+                return Response(
+                    {
+                        'error': (
+                            f"Ya existe una plantilla activa para este tipo/software: "
+                            f"'{conflicto.nombre}' ({conflicto.codigo_prefijo} · {conflicto.version_codigo}). "
+                            f"¿Confirmas crear esta nueva versión? La anterior quedará archivada (inactiva)."
+                        ),
+                        'requiere_confirmacion': True,
+                        'plantilla_conflicto': _plantilla_a_dict(conflicto),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
 
         plantilla = PlantillaDocumento.objects.create(
             tenant=tenant,
@@ -223,11 +272,11 @@ class PlantillaListCreateView(APIView):
             modo_origen=modo_origen,
             archivo_docx=archivo if modo_origen == ModoOrigenPlantilla.ARCHIVO else None,
             ruta_plantilla_html=ruta_plantilla_html if modo_origen == ModoOrigenPlantilla.HTML else None,
-            codigo_prefijo=(request.data.get('codigo_prefijo') or '').strip().upper()[:20] or None
-                if modo_origen == ModoOrigenPlantilla.HTML else None,
+            codigo_prefijo=codigo_prefijo,
             requiere_sla_facturacion=str(request.data.get('requiere_sla_facturacion', 'true')).lower() in ('1', 'true', 'si'),
             version_codigo=version_codigo,
             activa=activa,
+            portada=request.FILES.get('portada'),
             subida_por=request.user,
         )
 
@@ -245,9 +294,11 @@ class PlantillaListCreateView(APIView):
 
 class PlantillaDetailView(APIView):
     """
-    GET   /api/plantillas/plantillas/<id>/
-    PATCH /api/plantillas/plantillas/<id>/   (solo permite alternar {"activa": bool};
-                                               para cambiar el .docx se sube una plantilla nueva)
+    GET    /api/plantillas/plantillas/<id>/
+    PATCH  /api/plantillas/plantillas/<id>/   (solo permite alternar {"activa": bool};
+                                                para cambiar el .docx se sube una plantilla nueva)
+    DELETE /api/plantillas/plantillas/<id>/   (solo borradores — plantillas nunca confirmadas;
+                                                una confirmada se archiva, no se elimina)
     """
     permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
@@ -262,10 +313,11 @@ class PlantillaDetailView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
         plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        estaba_activa = plantilla.activa
 
         if 'activa' in request.data:
             plantilla.activa = str(request.data.get('activa')).lower() in ('1', 'true', 'si')
-            
+
         if 'nombre' in request.data:
             plantilla.nombre = request.data.get('nombre')
         if 'tipo_contrato' in request.data:
@@ -298,8 +350,16 @@ class PlantillaDetailView(APIView):
                 _validar_ruta_html_para_tipo(nueva_ruta, plantilla.tipo_contrato)
             plantilla.ruta_plantilla_html = nueva_ruta
 
+        if 'portada' in request.FILES:
+            plantilla.portada = request.FILES.get('portada')
+        elif 'portada' in request.data and request.data.get('portada') in [None, '', 'null']:
+            plantilla.portada = None
+
         if 'codigo_prefijo' in request.data:
-            plantilla.codigo_prefijo = (request.data.get('codigo_prefijo') or '').strip().upper()[:20] or None
+            nuevo_prefijo = (request.data.get('codigo_prefijo') or '').strip().upper()[:20]
+            if not nuevo_prefijo:
+                raise DRFValidationError({'codigo_prefijo': 'La familia de documento no puede quedar vacía.'})
+            plantilla.codigo_prefijo = nuevo_prefijo
 
         if 'requiere_sla_facturacion' in request.data:
             plantilla.requiere_sla_facturacion = str(request.data.get('requiere_sla_facturacion')).lower() in ('1', 'true', 'si')
@@ -313,8 +373,262 @@ class PlantillaDetailView(APIView):
             except ValueError:
                 pass
 
+        confirmar = str(request.data.get('confirmar', 'false')).lower() in ('1', 'true', 'si')
+        if plantilla.activa and not estaba_activa and not confirmar:
+            conflicto = _colision_activa(plantilla.tenant_id, plantilla.tipo_contrato, plantilla.software_id, exclude_pk=plantilla.pk)
+            if conflicto:
+                return Response(
+                    {
+                        'error': (
+                            f"Ya existe una plantilla activa para este tipo/software: "
+                            f"'{conflicto.nombre}' ({conflicto.codigo_prefijo} · {conflicto.version_codigo}). "
+                            f"¿Confirmas activar esta versión? La anterior quedará archivada (inactiva)."
+                        ),
+                        'requiere_confirmacion': True,
+                        'plantilla_conflicto': _plantilla_a_dict(conflicto),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
         plantilla.save()
         return Response(_plantilla_a_dict(plantilla))
+
+    def delete(self, request, pk):
+        if request.user.tenant_id is not None and not request.user.is_tenant_admin:
+            return Response(
+                {'error': 'Solo el Administrador de Cuenta puede eliminar plantillas.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+
+        if plantilla.activa:
+            return Response(
+                {'error': 'Esta plantilla está activa. Debes archivarla (desactivarla) antes de poder eliminarla.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        docs = DocumentoGenerado.objects.filter(plantilla=plantilla).select_related('contrato')
+        docs_pendientes = docs.filter(contrato__etapa__in=['BORRADOR', 'REVISION'])
+        total_docs_pendientes = len(docs_pendientes)
+
+        if total_docs_pendientes:
+            docs_info = []
+            for doc in docs_pendientes[:3]:
+                contrato_nombre = doc.contrato.nombre or f"Contrato #{doc.contrato_id}"
+                docs_info.append({'id': doc.contrato_id, 'nombre': contrato_nombre})
+
+            return Response(
+                {
+                    'error': (
+                        f"Esta versión está siendo utilizada por {total_docs_pendientes} contrato(s) "
+                        f"en etapa de Borrador o Revisión, por lo que no puede eliminarse."
+                    ),
+                    'documentos_afectados': docs_info,
+                    'total_docs': total_docs_pendientes
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        plantilla.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class FormularioDinamicoView(APIView):
+    """GET /api/plantillas/plantillas/<id>/formulario/"""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request, pk):
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        preguntas = plantilla.preguntas.all().prefetch_related('opciones')
+        data = []
+        for p in preguntas:
+            data.append({
+                'id': p.id,
+                'texto': p.texto,
+                'tipo': p.tipo,
+                'orden': p.orden,
+                'opciones': [{'id': o.id, 'texto': o.texto} for o in p.opciones.all()]
+            })
+        return Response({'plantilla_id': plantilla.id, 'preguntas': data})
+
+class EvaluarFormularioView(APIView):
+    """POST /api/plantillas/plantillas/<id>/evaluar-formulario/"""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def post(self, request, pk):
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        respuestas = request.data.get('respuestas', {})
+        
+        reglas = ReglaInclusionClausula.objects.filter(plantilla=plantilla).select_related('clausula_version', 'clausula_version__clausula', 'pregunta')
+        
+        versiones_incluidas = []
+        for regla in reglas:
+            pregunta_id = str(regla.pregunta_id)
+            if pregunta_id in respuestas:
+                respuesta = respuestas[pregunta_id]
+                if regla.pregunta.tipo == 'booleano':
+                    if str(respuesta).lower() in ('true', '1', 'si', 'True') and regla.respuesta_booleana == True:
+                        versiones_incluidas.append(regla.clausula_version)
+                    elif str(respuesta).lower() in ('false', '0', 'no', 'False') and regla.respuesta_booleana == False:
+                        versiones_incluidas.append(regla.clausula_version)
+                elif regla.pregunta.tipo == 'opcion_multiple':
+                    try:
+                        if int(respuesta) == regla.opcion_respuesta_id:
+                            versiones_incluidas.append(regla.clausula_version)
+                    except (ValueError, TypeError):
+                        pass
+                        
+        data = []
+        for v in versiones_incluidas:
+            data.append({
+                'clausula_id': v.clausula_id,
+                'version_id': v.id,
+                'titulo': v.clausula.nombre,
+                'texto': v.texto,
+                'tipo_texto': v.clausula.tipo_texto
+            })
+            
+        return Response({'clausulas': data})
+
+
+class FormularioBuilderView(APIView):
+    """GET y PUT para construir/editar todo el formulario de una plantilla de una vez."""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request, pk):
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        
+        preguntas = plantilla.preguntas.all().prefetch_related('opciones')
+        reglas = ReglaInclusionClausula.objects.filter(plantilla=plantilla).select_related('clausula_version', 'clausula_version__clausula')
+        
+        data = []
+        for p in preguntas:
+            pregunta_dict = {
+                'id': p.id,
+                'texto': p.texto,
+                'tipo': p.tipo,
+                'orden': p.orden,
+                'opciones': [{'id': o.id, 'texto': o.texto} for o in p.opciones.all()],
+                'reglas': []
+            }
+            for r in reglas:
+                if r.pregunta_id == p.id:
+                    pregunta_dict['reglas'].append({
+                        'id': r.id,
+                        'opcion_respuesta_id': r.opcion_respuesta_id,
+                        'respuesta_booleana': r.respuesta_booleana,
+                        'clausula_version_id': r.clausula_version_id,
+                        'clausula_nombre': r.clausula_version.clausula.nombre,
+                        'clausula_etiqueta': r.clausula_version.etiqueta,
+                    })
+            data.append(pregunta_dict)
+            
+        return Response({'plantilla_id': plantilla.id, 'preguntas': data})
+
+    def put(self, request, pk):
+        if request.user.tenant_id is not None and not request.user.is_tenant_admin:
+            if not getattr(request.user, 'is_moderador', False) and not request.user.is_superadmin:
+                return Response({'error': 'No tienes permisos para editar este formulario.'}, status=status.HTTP_403_FORBIDDEN)
+                
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        preguntas_data = request.data.get('preguntas', [])
+        
+        with transaction.atomic():
+            plantilla.preguntas.all().delete()
+            
+            for p_idx, p_data in enumerate(preguntas_data):
+                pregunta = PreguntaFormulario.objects.create(
+                    plantilla=plantilla,
+                    texto=p_data.get('texto', ''),
+                    tipo=p_data.get('tipo', 'booleano'),
+                    orden=p_idx
+                )
+                
+                opciones_map = {}
+                for o_data in p_data.get('opciones', []):
+                    opcion = OpcionRespuesta.objects.create(
+                        pregunta=pregunta,
+                        texto=o_data.get('texto', '')
+                    )
+                    if 'id' in o_data:
+                        opciones_map[str(o_data['id'])] = opcion
+                        
+                for r_data in p_data.get('reglas', []):
+                    clausula_version_id = r_data.get('clausula_version_id')
+                    if not clausula_version_id:
+                        continue
+                        
+                    opcion_id_str = str(r_data.get('opcion_respuesta_id'))
+                    db_opcion = opciones_map.get(opcion_id_str)
+                    
+                    ReglaInclusionClausula.objects.create(
+                        plantilla=plantilla,
+                        pregunta=pregunta,
+                        opcion_respuesta=db_opcion,
+                        respuesta_booleana=r_data.get('respuesta_booleana'),
+                        clausula_version_id=clausula_version_id
+                    )
+                    
+        return Response({'status': 'ok'})
+
+class PlantillaContratosView(APIView):
+    """GET /api/plantillas/plantillas/<id>/contratos/
+
+    Contratos que usan esta versión específica de plantilla (uno por contrato,
+    aunque se haya regenerado el documento varias veces con ella)."""
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request, pk):
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+
+        docs = list(
+            DocumentoGenerado.objects
+            .filter(plantilla=plantilla)
+            .select_related('contrato', 'contrato__cliente', 'contrato__software')
+            .order_by('contrato_id', '-fecha_generacion')
+        )
+
+        conteo_por_contrato = {}
+        mas_reciente_por_contrato = {}
+        for d in docs:
+            conteo_por_contrato[d.contrato_id] = conteo_por_contrato.get(d.contrato_id, 0) + 1
+            # order_by ya deja la más reciente primero dentro de cada contrato_id.
+            mas_reciente_por_contrato.setdefault(d.contrato_id, d)
+
+        def _cliente_nombre(cliente):
+            return (
+                getattr(getattr(cliente, 'personajuridica', None), 'razon_social', None)
+                or getattr(getattr(cliente, 'personanatural', None), 'nombre_completo', None)
+                or str(cliente)
+            )
+
+        resultado = []
+        for contrato_id, d in mas_reciente_por_contrato.items():
+            c = d.contrato
+            resultado.append({
+                'contrato_id': c.id,
+                'contrato_display': f'CTR-{str(c.id).zfill(6)}',
+                'nombre': c.nombre,
+                'cliente_id': c.cliente_id,
+                'cliente_nombre': _cliente_nombre(c.cliente),
+                'software_id': c.software_id,
+                'software_nombre': c.software.nombre if c.software_id else '',
+                'etapa': c.etapa,
+                'etapa_display': c.get_etapa_display(),
+                'status': c.status,
+                'monto': str(c.monto),
+                'fecha_ultima_generacion': d.fecha_generacion,
+                'total_generaciones': conteo_por_contrato[contrato_id],
+            })
+        resultado.sort(key=lambda r: r['fecha_ultima_generacion'], reverse=True)
+
+        return Response({
+            'plantilla_id': plantilla.id,
+            'plantilla_nombre': plantilla.nombre,
+            'plantilla_version': plantilla.version_codigo,
+            'total_contratos': len(resultado),
+            'results': resultado,
+        })
 
 
 class PlantillaPreviewPDFView(APIView):
@@ -347,6 +661,34 @@ class PlantillaPreviewPDFView(APIView):
         # Igual que en DescargarPDFView inline: el middleware pondría DENY.
         response.headers['X-Frame-Options'] = 'SAMEORIGIN'
         return response
+
+
+class PlantillaPreviewImageView(APIView):
+    """GET /api/plantillas/plantillas/<id>/preview-img/
+
+    Sirve una imagen JPG de la primera página de la plantilla para usar como portada/miniatura.
+    """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request, pk):
+        from .services.renderizado import obtener_preview_imagen
+        plantilla = get_object_or_404(scoped(PlantillaDocumento.objects.all(), request), pk=pk)
+        if plantilla.modo_origen == ModoOrigenPlantilla.ARCHIVO and not plantilla.archivo_docx:
+            return Response(
+                {'error': 'Esta plantilla en modo archivo no tiene un documento base (.docx) para previsualizar.'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        try:
+            img_path = obtener_preview_imagen(plantilla)
+        except Exception:
+            return Response(
+                {'error': 'No se pudo generar la portada de la plantilla.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return FileResponse(
+            open(img_path, 'rb'), as_attachment=False,
+            filename=f"plantilla_{plantilla.id}_portada.jpg", content_type='image/jpeg',
+        )
 
 
 class PlantillaRegenerarPreviewView(APIView):
@@ -441,6 +783,78 @@ class DocumentoGeneradoListView(APIView):
         return Response([_documento_a_dict(d) for d in qs])
 
 
+class PreviewBorradorPDFView(APIView):
+    """POST /api/plantillas/documentos/preview-borrador/  {contrato_id, campos?, clausulas?}
+
+    PDF efímero del documento tal como quedaría con el estado actual del
+    usuario: no crea DocumentoGenerado, no consume correlativo de Referencia y
+    no persiste nada en el contrato.
+
+    - `campos`: valores de los campos manuales de plantillas HTML.
+    - `clausulas`: bloques del editor de cláusulas SIN guardar (mismo shape que
+      el PATCH de clausulas_estructuradas) — se aplican al contrato solo en
+      memoria, para ver cómo queda el documento mientras se edita.
+    Soporta los tres modos de plantilla: html vía WeasyPrint (rápido) y
+    archivo/cláusulas vía docxtpl + LibreOffice (más lento; el frontend usa un
+    debounce mayor).
+    """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def post(self, request):
+        contrato_id = request.data.get('contrato_id')
+        if not contrato_id:
+            raise DRFValidationError({'contrato_id': 'Este campo es requerido.'})
+        contrato = get_object_or_404(
+            scoped(Contrato.objects.all(), request).select_related('cliente', 'software', 'sla'),
+            pk=contrato_id,
+        )
+        try:
+            plantilla = resolver_plantilla_activa(
+                contrato.tipo_contrato, contrato.software_id, contrato.tenant)
+        except SinPlantillaActivaError:
+            return Response(
+                {'error': 'No hay una plantilla activa para este contrato.'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        # Bloques en vivo del editor: mismo saneo que el PATCH real, pero el
+        # contrato NO se guarda — el override vive solo en esta instancia.
+        if 'clausulas' in request.data:
+            from contratos.views import _validar_clausulas_estructuradas
+            contrato.clausulas_estructuradas = _validar_clausulas_estructuradas(
+                request.data.get('clausulas'))
+
+        contexto = construir_contexto(contrato)
+        campos = request.data.get('campos')
+        aplicar_campos_manuales(contexto, campos if isinstance(campos, dict) else None)
+        # Correlativo ficticio: el real se consume solo al generar de verdad.
+        contexto['referencia'] = 'VISTA PREVIA'
+        try:
+            if plantilla.modo_origen == ModoOrigenPlantilla.HTML:
+                from .services.html_doc import html_a_pdf
+                html_bytes = renderizar_html(plantilla, contexto)
+                pdf_bytes = html_a_pdf(html_bytes.decode('utf-8'))
+            else:
+                from .services.renderizado import convertir_a_pdf, renderizar_docx
+                docx_bytes = renderizar_docx(plantilla, contexto, contrato)
+                pdf_bytes = convertir_a_pdf(docx_bytes)
+        except VariablesFaltantesError as exc:
+            return Response(
+                {'error': f'Faltan variables para la vista previa: {exc}'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        except (PlantillaRenderError, PlantillaHTMLNoEncontrada, ConversionPDFError) as exc:
+            return Response(
+                {'error': f'No se pudo generar la vista previa: {exc}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        from django.http import HttpResponse
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        # Se sirve embebido en un iframe del propio frontend.
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+        return response
+
+
 class GenerarDocumentoView(APIView):
     """POST /api/plantillas/documentos/generar/  {contrato_id, plantilla_id?, forzar?}"""
     permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
@@ -457,12 +871,18 @@ class GenerarDocumentoView(APIView):
 
         forzar = str(request.data.get('forzar', 'false')).lower() in ('1', 'true', 'si')
         if contrato.etapa in ETAPAS_CON_DOCUMENTO_EMITIDO and not forzar:
+            if contrato.firma_status == 'SIGNED':
+                aviso_firma_confirm = " El contrato está firmado electrónicamente: la firma quedará invalidada y deberá reenviarse a firma."
+            elif contrato.firma_status == 'PENDING' and contrato.firma_proveedor == 'OTP':
+                aviso_firma_confirm = " Hay un enlace de firma pendiente de confirmación: quedará invalidado y se reenviará uno nuevo al correo del cliente."
+            else:
+                aviso_firma_confirm = ""
             return Response(
                 {
                     'error': (
                         f"Este contrato ya está en etapa '{contrato.get_etapa_display()}'. "
                         "¿Confirmas generar una nueva versión del documento? "
-                        "Esto no elimina la versión anterior."
+                        "Esto no elimina la versión anterior." + aviso_firma_confirm
                     ),
                     'requiere_confirmacion': True,
                 },
@@ -489,6 +909,7 @@ class GenerarDocumentoView(APIView):
         try:
             documento = generar_documento(contrato, plantilla=plantilla, usuario=request.user, campos=campos)
             from contratos.models import HistorialEtapaContrato
+            from contratos.services import sincronizar_firma_tras_regeneracion
             HistorialEtapaContrato.objects.create(
                 contrato=contrato,
                 etapa_anterior=contrato.etapa,
@@ -496,6 +917,10 @@ class GenerarDocumentoView(APIView):
                 usuario=request.user,
                 notas="Actualización/Regeneración de documento PDF desde plantilla."
             )
+            # El contenido recién generado puede no coincidir más con una firma
+            # ya en curso (SIGNED) o con el enlace que tiene el cliente
+            # (PENDING) -- ver contratos.services.sincronizar_firma_tras_regeneracion.
+            aviso_firma = sincronizar_firma_tras_regeneracion(contrato, usuario=request.user)
         except SinPlantillaActivaError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
         except VariablesFaltantesError as exc:
@@ -508,7 +933,10 @@ class GenerarDocumentoView(APIView):
         except PlantillaRenderError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        return Response(_documento_a_dict(documento), status=status.HTTP_201_CREATED)
+        payload = _documento_a_dict(documento)
+        if aviso_firma:
+            payload['aviso_firma'] = aviso_firma
+        return Response(payload, status=status.HTTP_201_CREATED)
 
 
 class DescargarPDFView(APIView):
@@ -535,6 +963,51 @@ class DescargarPDFView(APIView):
         return response
 
 
+class DocumentoPreviewImageView(APIView):
+    """GET /api/plantillas/documentos/<id>/preview-img/
+
+    Primera página del PDF del documento como JPG (miniatura para las vistas de
+    contratos). Los DocumentoGenerado son write-once, así que la imagen se
+    cachea por id para siempre — regenerar crea otro documento (id nuevo).
+    """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request, pk):
+        documento = get_object_or_404(
+            scoped(DocumentoGenerado.objects.all(), request, 'contrato__tenant'), pk=pk,
+        )
+        if not documento.archivo_pdf:
+            return Response(
+                {'error': 'Este documento no tiene PDF para previsualizar.'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        cache_dir = Path(settings.MEDIA_ROOT) / 'documentos_previews'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        img_path = cache_dir / f"documento_{documento.id}.jpg"
+        if not img_path.exists():
+            try:
+                import pdfplumber
+                with pdfplumber.open(documento.archivo_pdf.path) as pdf:
+                    if not pdf.pages:
+                        raise ValueError('PDF sin páginas')
+                    # 150 dpi: suficiente para miniatura, a diferencia de la
+                    # portada de plantillas (300) que se muestra a mayor tamaño.
+                    im = pdf.pages[0].to_image(resolution=150)
+                    pil_img = getattr(im, 'original', im)
+                    if hasattr(pil_img, 'convert'):
+                        pil_img = pil_img.convert('RGB')
+                    pil_img.save(str(img_path), format='JPEG')
+            except Exception:
+                return Response(
+                    {'error': 'No se pudo generar la miniatura del documento.'},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+        return FileResponse(
+            open(img_path, 'rb'), as_attachment=False,
+            filename=f"documento_{documento.id}_miniatura.jpg", content_type='image/jpeg',
+        )
+
+
 class DescargarDocxView(APIView):
     """GET /api/plantillas/documentos/<id>/docx/ — auditoría interna: superadmin,
     Administrador de Cuenta o Auditor Legal del tenant."""
@@ -556,32 +1029,47 @@ class DescargarDocxView(APIView):
             content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         )
 
+def _clausula_a_dict(c: Clausula):
+    # Mismo shape que un item del listado GET: el frontend lo usa para hacer
+    # upsert local de la cláusula creada/editada sin refetchear la biblioteca.
+    # Filtrado de activas en Python: con prefetch_related lee de la caché.
+    return {
+        'id': c.id,
+        'cat': c.categoria,
+        'name': c.nombre,
+        'risk': c.riesgo,
+        'tipo_texto': c.tipo_texto,
+        'versions': [
+            {
+                'id': v.id,
+                'etiqueta': v.etiqueta,
+                'tipo': v.tipo,
+                'texto': v.texto,
+            } for v in c.versiones.all() if v.activa
+        ],
+    }
+
+
+def _tipo_texto_valido(valor, default=None):
+    """Normaliza el tipo de texto recibido del cliente; valor desconocido → default."""
+    if not valor:
+        return default
+    valor = str(valor).upper()
+    return valor if valor in TipoTextoClausula.values else default
+
+
 class ClausulaListView(APIView):
     """
-    GET /api/plantillas/clausulas/
+    GET /api/plantillas/clausulas/?tipo=SALUDO  (tipo opcional)
     """
     permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
 
     def get(self, request):
         qs = scoped(Clausula.objects.all(), request).prefetch_related('versiones').filter(activa=True)
-        data = []
-        for c in qs:
-            versions = [
-                {
-                    'id': v.id,
-                    'etiqueta': v.etiqueta,
-                    'tipo': v.tipo,
-                    'texto': v.texto,
-                } for v in c.versiones.all() if v.activa
-            ]
-            data.append({
-                'id': c.id,
-                'cat': c.categoria,
-                'name': c.nombre,
-                'risk': c.riesgo,
-                'versions': versions
-            })
-        return Response(data)
+        tipo = _tipo_texto_valido(request.query_params.get('tipo'))
+        if tipo:
+            qs = qs.filter(tipo_texto=tipo)
+        return Response([_clausula_a_dict(c) for c in qs])
 
     def post(self, request):
         data = request.data
@@ -593,6 +1081,8 @@ class ClausulaListView(APIView):
                     categoria=data.get('cat', 'General'),
                     nombre=data.get('name', 'Nueva Cláusula'),
                     riesgo=data.get('risk', 'Medio'),
+                    tipo_texto=_tipo_texto_valido(
+                        data.get('tipo_texto'), TipoTextoClausula.CLAUSULA),
                     activa=True
                 )
                 
@@ -605,7 +1095,7 @@ class ClausulaListView(APIView):
                         texto=v_data.get('text', '')
                     )
             
-            return Response({'status': 'ok', 'id': clausula.id}, status=status.HTTP_201_CREATED)
+            return Response({'status': 'ok', **_clausula_a_dict(clausula)}, status=status.HTTP_201_CREATED)
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -625,6 +1115,8 @@ class ClausulaDetailView(APIView):
                 clausula.categoria = data.get('cat', clausula.categoria)
                 clausula.nombre = data.get('name', clausula.nombre)
                 clausula.riesgo = data.get('risk', clausula.riesgo)
+                clausula.tipo_texto = _tipo_texto_valido(
+                    data.get('tipo_texto'), clausula.tipo_texto)
                 clausula.save()
 
                 active_versions = {v.id: v for v in clausula.versiones.filter(activa=True)}
@@ -663,16 +1155,64 @@ class ClausulaDetailView(APIView):
                         v.activa = False
                         v.save()
 
-            return Response({'status': 'ok'})
+            # Se relee para reflejar las versiones recién creadas/desactivadas
+            # (el reemplazo de versiones cambia sus IDs) — el frontend hace
+            # upsert local con este cuerpo en vez de refetchear todo.
+            return Response({'status': 'ok', **_clausula_a_dict(clausula)})
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-            
+
     def delete(self, request, pk):
         clausula = get_object_or_404(scoped(Clausula.objects.all(), request), pk=pk)
         # Soft delete
         clausula.activa = False
         clausula.save()
         return Response({'status': 'deleted'})
+
+
+class ClausulaIndiceView(APIView):
+    """
+    GET /api/plantillas/clausulas/indice/?tipo=SALUDO  (tipo opcional)
+
+    Índice compacto de la biblioteca agrupado por tipo de texto, resuelto en una
+    sola consulta (apoyada en idx_clausula_tenant_tipo). Pensado para recopilar
+    de un vistazo qué textos existen (saludos, despedidas, cierres, cláusulas)
+    sin traer los cuerpos completos.
+    """
+    permission_classes = [IsTenantMember, RequiresFeature('plantillas')]
+
+    def get(self, request):
+        qs = scoped(Clausula.objects.all(), request).filter(activa=True)
+        tipo = _tipo_texto_valido(request.query_params.get('tipo'))
+        if tipo:
+            qs = qs.filter(tipo_texto=tipo)
+        filas = (
+            qs.values('id', 'nombre', 'categoria', 'riesgo', 'tipo_texto')
+              .annotate(versiones=Count('versiones', filter=Q(versiones__activa=True)))
+              .order_by('tipo_texto', 'categoria', 'nombre')
+        )
+        labels = dict(TipoTextoClausula.choices)
+        grupos = {}
+        for fila in filas:
+            grupo = grupos.setdefault(fila['tipo_texto'], {
+                'tipo': fila['tipo_texto'],
+                'label': labels.get(fila['tipo_texto'], fila['tipo_texto']),
+                'items': [],
+            })
+            grupo['items'].append({
+                'id': fila['id'],
+                'nombre': fila['nombre'],
+                'categoria': fila['categoria'],
+                'riesgo': fila['riesgo'],
+                'versiones': fila['versiones'],
+            })
+        # Orden estable según la declaración de choices (cláusulas primero).
+        orden = list(TipoTextoClausula.values)
+        tipos = sorted(grupos.values(), key=lambda g: orden.index(g['tipo']))
+        return Response({
+            'total': sum(len(g['items']) for g in tipos),
+            'tipos': tipos,
+        })
 
 
 class EmitidosListView(APIView):
@@ -741,8 +1281,8 @@ class EmitidosListView(APIView):
                 'software_id': d.contrato.software_id,
                 'software_nombre': d.contrato.software.nombre if d.contrato.software_id else '',
                 'plantilla_id': d.plantilla_id,
-                'plantilla_nombre': d.plantilla.nombre,
-                'plantilla_version': d.plantilla.version_codigo,
+                'plantilla_nombre': d.plantilla.nombre if d.plantilla_id else 'Eliminada',
+                'plantilla_version': d.plantilla.version_codigo if d.plantilla_id else 'N/A',
                 'hash_sha256': d.hash_sha256,
                 'fecha_generacion': d.fecha_generacion,
                 'generado_por': (

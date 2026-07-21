@@ -37,3 +37,19 @@ class LogAceptacion(models.Model):
             # Índice GIN para buscar rápidamente propiedades dentro del JSONB
             GinIndex(fields=['metadata_auditoria'], name='idx_log_metadata_gin'),
         ]
+
+
+class AnalisisContratoIA(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    contrato = models.ForeignKey('contratos.Contrato', on_delete=models.CASCADE, related_name='analisis_ia', db_column='contrato_id')
+    fecha_analisis = models.DateTimeField(auto_now_add=True)
+    checklist_cumplido = models.BooleanField(default=False)
+    # { "required": [{"doc": "NDA", "cumple": true, "detalles": "..."}, ...], "missing": [...] }
+    resultado_checklist_json = models.JSONField(default=dict)
+    # [ { "clausula_nombre": "Confidencialidad", "riesgo": "Alto", "similitud": 85, "explicacion": "...", "diff": "...", "original": "...", "standard": "..." } ]
+    riesgos_detectados_json = models.JSONField(default=list)
+    texto_analizado = models.TextField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'legal_analisiscontratoia'
+        ordering = ['-fecha_analisis']
